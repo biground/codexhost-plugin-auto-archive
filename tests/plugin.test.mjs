@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { activate, evaluateThread, normalizeSettings } from "../backend/index.mjs";
+import { activate, evaluateThread, normalizeSettings, resolveThreadProject } from "../backend/index.mjs";
 import { parseSessionIdFromRowKey } from "../web/index.mjs";
 
 const PLUGIN_ROOT = path.resolve(import.meta.dirname, "..");
@@ -286,4 +286,32 @@ test("parseSessionIdFromRowKey accurately extracts Web session IDs and ignores n
   assert.equal(parseSessionIdFromRowKey("section:pinned"), null);
   assert.equal(parseSessionIdFromRowKey("overflow:flat"), null);
   assert.equal(parseSessionIdFromRowKey(""), null);
+});
+
+test("resolveThreadProject matches explicit assignments, longest rootPath prefix, and respects projectless", () => {
+  const workspace = {
+    projects: [
+      { id: "p-root", name: "Workspace", rootPaths: ["C:\\work"] },
+      { id: "p-sub", name: "CodexHost", rootPaths: ["C:\\work\\codex-host"] },
+    ],
+    assignments: { "t-assigned": "p-root" },
+    projectlessSet: new Set(["t-projectless"]),
+  };
+
+  assert.deepEqual(
+    resolveThreadProject({ id: "t-assigned", cwd: "C:\\work\\codex-host" }, workspace),
+    { projectId: "p-root", projectName: "Workspace" },
+  );
+  assert.deepEqual(
+    resolveThreadProject({ id: "t-sub", cwd: "c:\\work\\codex-host\\packages" }, workspace),
+    { projectId: "p-sub", projectName: "CodexHost" },
+  );
+  assert.deepEqual(
+    resolveThreadProject({ id: "t-projectless", cwd: "C:\\work\\codex-host" }, workspace),
+    { projectId: null, projectName: "" },
+  );
+  assert.deepEqual(
+    resolveThreadProject({ id: "t-unknown", cwd: "D:\\other" }, workspace),
+    { projectId: null, projectName: "" },
+  );
 });

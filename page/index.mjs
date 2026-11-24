@@ -33,17 +33,23 @@ export async function mount(root, api) {
     nextRunAt: null,
     nextPendingDueAt: null,
     nowMs: Date.now(),
-    stats: { totalActive: 0, expiredCount: 0, pendingCount: 0, protectedActiveCount: 0 },
+    projects: [],
+    stats: { totalActive: 0, expiredCount: 0, pendingCount: 0, protectedActiveCount: 0, archivedCount: 0 },
     threads: [],
+    archived: [],
     history: [],
     loading: true,
     refreshing: false,
+    archivedRefreshing: false,
     saving: false,
     sweeping: false,
     sweepProgress: null,
     activeTab: "sessions",
     filter: "all",
+    archivedFilter: "all",
     search: "",
+    archivedSearch: "",
+    expandedProjects: new Set(),
     banner: null,
     bannerTone: "info",
     confirmPendingCount: null,
@@ -86,17 +92,23 @@ export async function mount(root, api) {
     }
     const wasSweeping = state.sweeping;
     try {
-      const [backendState, threadList] = await Promise.all([
+      const includeArchived = state.activeTab === "history" || forceRefresh;
+      const [backendState, threadList, archivedList] = await Promise.all([
         api.backend.invoke("getState", forceRefresh ? { refresh: true } : undefined),
         api.backend.invoke("listThreads", forceRefresh ? { refresh: true } : undefined).catch(() => null),
+        includeArchived
+          ? api.backend.invoke("listArchived", forceRefresh ? { refresh: true } : undefined).catch(() => null)
+          : Promise.resolve(null),
       ]);
       if (api.signal.aborted) return;
       if (backendState && typeof backendState === "object") {
         state.settings = normalizeSettings(backendState.settings);
         state.protectedThreadIds = normalizeProtectedIds(backendState.protectedThreadIds);
+        if (Array.isArray(backendState.projects)) state.projects = backendState.projects;
         state.hostConnected = Boolean(backendState.hostConnected);
         state.hostError = backendState.hostError ?? null;
         state.refreshing = Boolean(backendState.refreshing);
+        state.archivedRefreshing = Boolean(backendState.archivedRefreshing);
         state.sweeping = Boolean(backendState.sweeping);
         state.sweepProgress = backendState.sweepProgress ?? null;
         state.lastRunAt = backendState.lastRunAt ?? null;
@@ -118,16 +130,31 @@ export async function mount(root, api) {
       }
       if (threadList && Array.isArray(threadList.threads)) {
         state.threads = threadList.threads;
+        if (Array.isArray(threadList.projects) && threadList.projects.length > 0) {
+          state.projects = threadList.projects;
+        }
         state.nowMs = threadList.nowMs ?? Date.now();
         state.refreshing = state.refreshing || Boolean(threadList.refreshing);
         state.stats = {
+          ...state.stats,
           totalActive: threadList.threads.length,
           expiredCount: threadList.threads.filter((item) => item.eligible).length,
           pendingCount: threadList.threads.filter((item) => item.pendingDueAt !== null).length,
           protectedActiveCount: threadList.threads.filter((item) => item.isProtected).length,
         };
       }
-      scheduleFastPoll(state.refreshing || state.sweeping);
+      if (archivedList && Array.isArray(archivedList.archived)) {
+        state.archived = archivedList.archived;
+        if (Array.isArray(archivedList.projects) && archivedList.projects.length > 0) {
+          state.projects = archivedList.projects;
+        }
+        state.archivedRefreshing = Boolean(archivedList.refreshing);
+        state.stats = {
+          ...state.stats,
+          archivedCount: archivedList.archived.length,
+        };
+      }
+      scheduleFastPoll(state.refreshing || state.archivedRefreshing || state.sweeping);
     } catch (error) {
       state.hostConnected = false;
       state.hostError = error instanceof Error ? error.message : String(error);
@@ -232,10 +259,55 @@ export async function mount(root, api) {
       if (!query) return true;
       return (
         (item.title || "").toLowerCase().includes(query) ||
+        (item.projectName || "").toLowerCase().includes(query) ||
         (item.cwd || "").toLowerCase().includes(query) ||
         (item.id || "").toLowerCase().includes(query) ||
         (item.harnessId || "").toLowerCase().includes(query)
       );
+    });
+  }
+
+  function filteredArchived() {
+    const query = state.archivedSearch.trim().toLowerCase();
+    return state.archived.filter((item) => {
+      if (state.archivedFilter === "plugin" && !item.isPluginArchived) return false;
+      if (!query) return true;
+      return (
+        (item.title || "").toLowerCase().includes(query) ||
+        (item.projectName || "").toLowerCase().includes(query) ||
+        (item.cwd || "").toLowerCase().includes(query) ||
+        (item.threadId || "").toLowerCase().includes(query) ||
+        (item.harnessId || "").toLowerCase().includes(query)
+      );
+    });
+  }
+
+  function groupArchivedByProject(items, msg) {
+    const UNGROUPED_KEY = "__ungrouped__";
+    const orderMap = new Map();
+    state.projects.forEach((p, idx) => orderMap.set(p.id, idx));
+
+    const groups = new Map();
+    for (const item of items) {
+      const key = item.projectId || UNGROUPED_KEY;
+      let group = groups.get(key);
+      if (!group) {
+        group = {
+          key,
+          name: item.projectId ? item.projectName || item.projectId : msg.ungroupedProject,
+          isUngrouped: !item.projectId,
+          order: item.projectId ? (orderMap.get(item.projectId) ?? 10_000) : 99_999,
+          items: [],
+        };
+        groups.set(key, group);
+      }
+      group.items.push(item);
+    }
+
+    return [...groups.values()].sort((a, b) => {
+      if (a.isUngrouped !== b.isUngrouped) return a.isUngrouped ? 1 : -1;
+      if (a.order !== b.order) return a.order - b.order;
+      return a.name.localeCompare(b.name);
     });
   }
 
@@ -244,6 +316,9 @@ export async function mount(root, api) {
     const msg = createMessages(locale);
     const s = state.settings;
     const visibleThreads = filteredThreads();
+    const visibleArchived = filteredArchived();
+    const archivedGroups = groupArchivedByProject(visibleArchived, msg);
+    const archivedTotal = state.archived.length || state.stats.archivedCount || state.history.length;
 
     root.innerHTML = `
       <div class="aag-page">
@@ -281,13 +356,11 @@ export async function mount(root, api) {
                   ? `正在归档超期会话：${state.sweepProgress.processed} / ${state.sweepProgress.total}（成功 ${state.sweepProgress.archivedCount}）…`
                   : `Archiving expired sessions: ${state.sweepProgress.processed} / ${state.sweepProgress.total} (${state.sweepProgress.archivedCount} archived)…`,
               )}</div>`
-            : state.refreshing && state.threads.length === 0
-              ? `<div class="aag-banner is-info" role="status">${escapeHtml(
-                  locale.toLowerCase().startsWith("zh")
-                    ? "正在从共享 Host 同步全量会话目录…"
-                    : "Syncing full session catalog from shared Host…",
-                )}</div>`
-              : ""
+            : state.activeTab === "history" && state.archivedRefreshing
+              ? `<div class="aag-banner is-info" role="status">${escapeHtml(msg.syncArchivedHint)} (${state.archived.length})</div>`
+              : state.refreshing && state.threads.length === 0
+                ? `<div class="aag-banner is-info" role="status">${escapeHtml(msg.syncActiveHint)}</div>`
+                : ""
         }
 
         <section class="aag-stats">
@@ -305,7 +378,7 @@ export async function mount(root, api) {
           </div>
           <div class="aag-stat-card">
             <div class="aag-stat-label">${escapeHtml(msg.statArchived)}</div>
-            <div class="aag-stat-value">${state.history.length}</div>
+            <div class="aag-stat-value">${archivedTotal}</div>
           </div>
         </section>
 
@@ -407,7 +480,7 @@ export async function mount(root, api) {
                 ${escapeHtml(msg.tabSessions)} (${state.threads.length})
               </button>
               <button type="button" class="aag-tab ${state.activeTab === "history" ? "is-active" : ""}" data-tab="history">
-                ${escapeHtml(msg.tabHistory)} (${state.history.length})
+                ${escapeHtml(msg.tabHistory)} (${archivedTotal})
               </button>
             </div>
 
@@ -421,16 +494,31 @@ export async function mount(root, api) {
                     </div>
                     <input type="search" class="aag-search" data-search value="${escapeHtml(state.search)}" placeholder="${escapeHtml(msg.searchPlaceholder)}" />
                   </div>`
-                : state.history.length > 0
-                  ? `<button type="button" class="aag-btn" data-action="clearHistory">${escapeHtml(msg.clearHistory)}</button>`
-                  : ""
+                : `<div class="aag-filter-tools">
+                    <div class="aag-filter-pills">
+                      <button type="button" class="aag-chip ${state.archivedFilter === "all" ? "is-active" : ""}" data-archived-filter="all">${escapeHtml(msg.filterArchivedAll)} (${state.archived.length})</button>
+                      <button type="button" class="aag-chip ${state.archivedFilter === "plugin" ? "is-active" : ""}" data-archived-filter="plugin">${escapeHtml(msg.filterArchivedPlugin)} (${state.history.length})</button>
+                    </div>
+                    <input type="search" class="aag-search" data-archived-search value="${escapeHtml(state.archivedSearch)}" placeholder="${escapeHtml(msg.searchArchivedPlaceholder)}" />
+                    ${
+                      archivedGroups.length > 0
+                        ? `<button type="button" class="aag-btn" data-action="expandAll">${escapeHtml(msg.expandAll)}</button>
+                           <button type="button" class="aag-btn" data-action="collapseAll">${escapeHtml(msg.collapseAll)}</button>`
+                        : ""
+                    }
+                    ${
+                      state.history.length > 0
+                        ? `<button type="button" class="aag-btn" data-action="clearHistory">${escapeHtml(msg.clearHistory)}</button>`
+                        : ""
+                    }
+                  </div>`
             }
           </div>
 
           ${
             state.activeTab === "sessions"
               ? renderSessionRows(visibleThreads, msg)
-              : renderHistoryRows(state.history, msg)
+              : renderArchivedGroups(archivedGroups, msg)
           }
         </section>
       </div>
@@ -469,6 +557,7 @@ export async function mount(root, api) {
                 <div class="aag-row-title-line">
                   <span class="aag-row-title">${escapeHtml(item.title)}</span>
                   <span class="aag-harness-tag">${escapeHtml(item.harnessId || "codex")}</span>
+                  ${item.projectName ? `<span class="aag-tag aag-project-tag">${escapeHtml(item.projectName)}</span>` : ""}
                   ${tags.join("")}
                 </div>
                 <div class="aag-row-meta">
@@ -494,34 +583,60 @@ export async function mount(root, api) {
     </div>`;
   }
 
-  function renderHistoryRows(items, msg) {
-    if (items.length === 0) {
+  function renderArchivedGroups(groups, msg) {
+    if (groups.length === 0) {
       return `<div class="aag-empty">${escapeHtml(msg.noHistory)}</div>`;
     }
-    return `<div class="aag-rows">
-      ${items
-        .map(
-          (item) => `
-        <div class="aag-row">
-          <div class="aag-row-info">
-            <div class="aag-row-title-line">
-              <span class="aag-row-title">${escapeHtml(item.title || item.threadId)}</span>
-              <span class="aag-harness-tag">${escapeHtml(item.harnessId || "codex")}</span>
-              <span class="aag-tag">${escapeHtml(item.trigger === "auto" ? msg.triggerAuto : msg.triggerManual)}</span>
+    const searching = state.archivedSearch.trim().length > 0;
+    return `<div class="aag-groups">
+      ${groups
+        .map((group) => {
+          const collapsed = !searching && !state.expandedProjects.has(group.key);
+          return `
+            <div class="aag-group ${collapsed ? "is-collapsed" : ""}">
+              <button type="button" class="aag-group-header" data-toggle-group="${escapeHtml(group.key)}" aria-expanded="${String(!collapsed)}">
+                <span class="aag-chevron">${collapsed ? "▸" : "▾"}</span>
+                <span class="aag-group-icon">${group.isUngrouped ? "🗂️" : "📁"}</span>
+                <span class="aag-group-name">${escapeHtml(group.name)}</span>
+                <span class="aag-group-count">${group.items.length}</span>
+              </button>
+              ${
+                collapsed
+                  ? ""
+                  : `<div class="aag-group-body">
+                      ${group.items
+                        .map(
+                          (item) => `
+                        <div class="aag-row">
+                          <div class="aag-row-info">
+                            <div class="aag-row-title-line">
+                              <span class="aag-row-title">${escapeHtml(item.title || item.threadId)}</span>
+                              <span class="aag-harness-tag">${escapeHtml(item.harnessId || "codex")}</span>
+                              ${
+                                item.isPluginArchived
+                                  ? `<span class="aag-tag is-protected">${escapeHtml(item.trigger === "auto" ? msg.triggerAuto : msg.triggerManual)}</span>`
+                                  : ""
+                              }
+                            </div>
+                            <div class="aag-row-meta">
+                              <span>${escapeHtml(formatTimestamp(item.archivedAt ?? item.updatedAtMs, locale))}</span>
+                              ${item.daysInactive != null ? `<span>·</span><span>${escapeHtml(formatDaysAgo(item.daysInactive, locale))}</span>` : ""}
+                              ${item.cwd ? `<span>·</span><span class="aag-cwd">${escapeHtml(item.cwd)}</span>` : ""}
+                            </div>
+                          </div>
+                          <div class="aag-btn-group">
+                            <button type="button" class="aag-btn" data-restore="${escapeHtml(item.threadId)}" data-title="${escapeHtml(item.title || "")}">${escapeHtml(msg.restore)}</button>
+                            <button type="button" class="aag-btn is-primary" data-restore-protect="${escapeHtml(item.threadId)}" data-title="${escapeHtml(item.title || "")}">${escapeHtml(msg.restoreAndProtect)}</button>
+                          </div>
+                        </div>
+                      `,
+                        )
+                        .join("")}
+                    </div>`
+              }
             </div>
-            <div class="aag-row-meta">
-              <span>${escapeHtml(formatTimestamp(item.archivedAt, locale))}</span>
-              ${item.daysInactive != null ? `<span>·</span><span>${escapeHtml(formatDaysAgo(item.daysInactive, locale))}</span>` : ""}
-              ${item.cwd ? `<span>·</span><span class="aag-cwd">${escapeHtml(item.cwd)}</span>` : ""}
-            </div>
-          </div>
-          <div class="aag-btn-group">
-            <button type="button" class="aag-btn" data-restore="${escapeHtml(item.threadId)}" data-title="${escapeHtml(item.title || "")}">${escapeHtml(msg.restore)}</button>
-            <button type="button" class="aag-btn is-primary" data-restore-protect="${escapeHtml(item.threadId)}" data-title="${escapeHtml(item.title || "")}">${escapeHtml(msg.restoreAndProtect)}</button>
-          </div>
-        </div>
-      `,
-        )
+          `;
+        })
         .join("")}
     </div>`;
   }
@@ -611,8 +726,12 @@ export async function mount(root, api) {
 
     root.querySelectorAll("[data-tab]").forEach((btn) => {
       btn.addEventListener("click", () => {
-        state.activeTab = btn.getAttribute("data-tab") || "sessions";
+        const nextTab = btn.getAttribute("data-tab") || "sessions";
+        state.activeTab = nextTab;
         render();
+        if (nextTab === "history" && state.archived.length === 0) {
+          void refreshAll(true, false);
+        }
       });
     });
 
@@ -623,6 +742,35 @@ export async function mount(root, api) {
       });
     });
 
+    root.querySelectorAll("[data-archived-filter]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        state.archivedFilter = btn.getAttribute("data-archived-filter") || "all";
+        render();
+      });
+    });
+
+    root.querySelectorAll("[data-toggle-group]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const key = btn.getAttribute("data-toggle-group");
+        if (!key) return;
+        if (state.expandedProjects.has(key)) state.expandedProjects.delete(key);
+        else state.expandedProjects.add(key);
+        render();
+      });
+    });
+
+    root.querySelector('[data-action="expandAll"]')?.addEventListener("click", () => {
+      const msg = createMessages(locale);
+      const groups = groupArchivedByProject(filteredArchived(), msg);
+      state.expandedProjects = new Set(groups.map((g) => g.key));
+      render();
+    });
+
+    root.querySelector('[data-action="collapseAll"]')?.addEventListener("click", () => {
+      state.expandedProjects.clear();
+      render();
+    });
+
     const searchInput = root.querySelector("[data-search]");
     if (searchInput) {
       searchInput.addEventListener("input", (event) => {
@@ -630,6 +778,20 @@ export async function mount(root, api) {
         const pos = event.target.selectionStart ?? state.search.length;
         render();
         const nextInput = root.querySelector("[data-search]");
+        if (nextInput) {
+          nextInput.focus();
+          nextInput.setSelectionRange(pos, pos);
+        }
+      });
+    }
+
+    const archivedSearchInput = root.querySelector("[data-archived-search]");
+    if (archivedSearchInput) {
+      archivedSearchInput.addEventListener("input", (event) => {
+        state.archivedSearch = event.target.value || "";
+        const pos = event.target.selectionStart ?? state.archivedSearch.length;
+        render();
+        const nextInput = root.querySelector("[data-archived-search]");
         if (nextInput) {
           nextInput.focus();
           nextInput.setSelectionRange(pos, pos);

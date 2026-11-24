@@ -4,10 +4,12 @@ import path from "node:path";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MINUTE_MS = 60 * 1000;
-const MAX_CATALOG_PAGES = 50;
+const MAX_CATALOG_PAGES = 100;
+const MAX_ARCHIVED_RETURN = 2000;
 const MAX_HISTORY_ITEMS = 200;
 const INITIAL_SWEEP_DELAY_MS = 120_000;
 const CATALOG_TTL_MS = 45_000;
+const ARCHIVED_TTL_MS = 90_000;
 const RPC_TIMEOUT_MS = 25_000;
 
 export const DEFAULT_SETTINGS = Object.freeze({
@@ -113,6 +115,63 @@ export function normalizeTimestampMs(value) {
   return null;
 }
 
+function normalizeFsPath(p) {
+  if (typeof p !== "string" || !p.trim()) return "";
+  let normalized = p.trim().replaceAll("\\", "/").replace(/\/+$/u, "");
+  if (/^[A-Za-z]:/u.test(normalized)) {
+    normalized = normalized.toLowerCase();
+  }
+  return normalized;
+}
+
+export function resolveThreadProject(thread, workspace) {
+  if (!workspace || !Array.isArray(workspace.projects) || workspace.projects.length === 0) {
+    return { projectId: null, projectName: "" };
+  }
+  const projectsById = new Map();
+  for (const project of workspace.projects) {
+    if (project && typeof project.id === "string") {
+      projectsById.set(project.id, project);
+    }
+  }
+  const id = typeof thread?.id === "string" ? thread.id : typeof thread?.threadId === "string" ? thread.threadId : "";
+  const assignedId =
+    (id && workspace.assignments && workspace.assignments[id]) ||
+    (typeof thread?.projectId === "string" ? thread.projectId : null);
+  if (assignedId && projectsById.has(assignedId)) {
+    const project = projectsById.get(assignedId);
+    return { projectId: project.id, projectName: project.name || project.id };
+  }
+
+  const projectlessSet = workspace.projectlessSet;
+  if (id && projectlessSet?.has(id)) {
+    return { projectId: null, projectName: "" };
+  }
+
+  const cwd = normalizeFsPath(thread?.cwd || "");
+  if (!cwd) return { projectId: null, projectName: "" };
+
+  let bestProject = null;
+  let bestLen = -1;
+  for (const project of workspace.projects) {
+    const roots = Array.isArray(project?.rootPaths) ? project.rootPaths : [];
+    for (const root of roots) {
+      const normRoot = normalizeFsPath(root);
+      if (!normRoot) continue;
+      if (cwd === normRoot || cwd.startsWith(`${normRoot}/`)) {
+        if (normRoot.length > bestLen) {
+          bestLen = normRoot.length;
+          bestProject = project;
+        }
+      }
+    }
+  }
+  if (bestProject) {
+    return { projectId: bestProject.id, projectName: bestProject.name || bestProject.id };
+  }
+  return { projectId: null, projectName: "" };
+}
+
 export function isThreadBusy(thread, treeNode) {
   const treeStatus = treeNode?.status;
   if (treeStatus === "running" || treeStatus === "waiting") return true;
@@ -136,15 +195,40 @@ export function extractThreadTitle(thread) {
   const candidates = [thread?.name, thread?.title, thread?.preview];
   for (const candidate of candidates) {
     if (typeof candidate === "string" && candidate.trim()) {
-      return candidate.trim().replace(/\s+/gu, " ").slice(0, 180);
+      return candidate.trim().replace(/\s+/gu, " ").slice(0, 160);
     }
   }
   return typeof thread?.id === "string" ? thread.id : "Untitled Session";
 }
 
+function compactThreadRow(thread) {
+  return {
+    id: thread.id,
+    name: typeof thread.name === "string" ? thread.name.slice(0, 180) : null,
+    title: typeof thread.title === "string" ? thread.title.slice(0, 180) : null,
+    preview: typeof thread.preview === "string" ? thread.preview.slice(0, 180) : null,
+    cwd: typeof thread.cwd === "string" ? thread.cwd.slice(0, 260) : "",
+    projectId: typeof thread.projectId === "string" ? thread.projectId : null,
+    modelProvider: typeof thread.modelProvider === "string" ? thread.modelProvider : null,
+    createdAt: thread.createdAt ?? null,
+    updatedAt: thread.updatedAt ?? null,
+    recencyAt: thread.recencyAt ?? null,
+    status: thread.status ?? null,
+    isPinned: Boolean(thread.isPinned),
+  };
+}
+
 export function evaluateThread(thread, options) {
-  const { nowMs, settings, protectedSet, pinnedSet, treeNodes, ownershipMap, pendingMap = {} } =
-    options;
+  const {
+    nowMs,
+    settings,
+    protectedSet,
+    pinnedSet,
+    treeNodes,
+    ownershipMap,
+    pendingMap = {},
+    workspace = null,
+  } = options;
   const id = typeof thread?.id === "string" ? thread.id : "";
   const updatedAtMs =
     normalizeTimestampMs(thread?.updatedAt) ??
@@ -178,11 +262,14 @@ export function evaluateThread(thread, options) {
 
   const eligible = Boolean(id) && isExpired && skipReason === null;
   const pending = eligible ? pendingMap[id] ?? null : null;
+  const project = resolveThreadProject(thread, workspace);
 
   return {
     id,
     title: extractThreadTitle(thread),
     cwd: typeof thread?.cwd === "string" ? thread.cwd : "",
+    projectId: project.projectId,
+    projectName: project.projectName,
     harnessId,
     createdAtMs,
     updatedAtMs,
@@ -265,6 +352,43 @@ export function createHostRpcClient(clientHostsDir, fetchImpl = globalThis.fetch
   return { request, isOnline };
 }
 
+export async function readWorkspaceMetadata(rpc, threadIds = []) {
+  try {
+    const result = await rpc.request("codexhost/workspace/read", { threadIds });
+    const projects = Array.isArray(result?.projects)
+      ? result.projects
+          .filter((p) => p && typeof p.id === "string")
+          .map((p) => ({
+            id: p.id,
+            name: typeof p.name === "string" && p.name.trim() ? p.name.trim() : p.id,
+            rootPaths: Array.isArray(p.rootPaths)
+              ? p.rootPaths.filter((r) => typeof r === "string")
+              : [],
+          }))
+      : [];
+    const assignments =
+      result?.assignments && typeof result.assignments === "object" && !Array.isArray(result.assignments)
+        ? result.assignments
+        : {};
+    const projectless = Array.isArray(result?.projectless)
+      ? result.projectless.filter((id) => typeof id === "string")
+      : [];
+    return {
+      projects,
+      assignments,
+      projectless,
+      projectlessSet: new Set(projectless),
+    };
+  } catch {
+    return {
+      projects: [],
+      assignments: {},
+      projectless: [],
+      projectlessSet: new Set(),
+    };
+  }
+}
+
 export async function readAllActiveThreads(rpc, options = {}) {
   const { onPage, isAborted } = options;
   const byId = new Map();
@@ -302,19 +426,7 @@ export async function readAllActiveThreads(rpc, options = {}) {
     for (const thread of threads) {
       if (!thread || typeof thread.id !== "string" || archivedSet.has(thread.id)) continue;
       if (!byId.has(thread.id)) {
-        byId.set(thread.id, {
-          id: thread.id,
-          name: typeof thread.name === "string" ? thread.name : null,
-          title: typeof thread.title === "string" ? thread.title : null,
-          preview: typeof thread.preview === "string" ? thread.preview.slice(0, 200) : null,
-          cwd: typeof thread.cwd === "string" ? thread.cwd : "",
-          modelProvider: typeof thread.modelProvider === "string" ? thread.modelProvider : null,
-          createdAt: thread.createdAt ?? null,
-          updatedAt: thread.updatedAt ?? null,
-          recencyAt: thread.recencyAt ?? null,
-          status: thread.status ?? null,
-          isPinned: Boolean(thread.isPinned),
-        });
+        byId.set(thread.id, compactThreadRow(thread));
       }
     }
     onPage?.({
@@ -333,6 +445,51 @@ export async function readAllActiveThreads(rpc, options = {}) {
     ownershipMap,
     pinnedSet,
     treeNodes,
+  };
+}
+
+export async function readAllArchivedThreads(rpc, options = {}) {
+  const { onPage, isAborted } = options;
+  const byId = new Map();
+  const ownershipMap = new Map();
+
+  let archivedCursor = undefined;
+  for (let page = 0; page < MAX_CATALOG_PAGES; page++) {
+    if (isAborted?.()) break;
+    // Pass live: null so Host skips live native pages and walks only the archived branch.
+    const params =
+      archivedCursor === undefined
+        ? { includeArchived: true, officialCursor: { live: null } }
+        : { includeArchived: true, officialCursor: { live: null, archived: archivedCursor } };
+    const result = await rpc.request("codexhost/thread/catalog/read", params);
+    const threads = Array.isArray(result?.threads) ? result.threads : [];
+    const ownerships = Array.isArray(result?.ownership) ? result.ownership : [];
+    const archivedSet = new Set(
+      Array.isArray(result?.archivedThreadIds) ? result.archivedThreadIds : [],
+    );
+    for (const owner of ownerships) {
+      if (owner && typeof owner.threadId === "string") {
+        ownershipMap.set(owner.threadId, owner);
+      }
+    }
+    for (const thread of threads) {
+      if (!thread || typeof thread.id !== "string" || !archivedSet.has(thread.id)) continue;
+      if (!byId.has(thread.id)) {
+        byId.set(thread.id, compactThreadRow(thread));
+      }
+    }
+    onPage?.({
+      threads: [...byId.values()],
+      ownershipMap: new Map(ownershipMap),
+    });
+    const nextCursor = result?.officialCursor?.archived ?? null;
+    if (!nextCursor || nextCursor === archivedCursor) break;
+    archivedCursor = nextCursor;
+  }
+
+  return {
+    threads: [...byId.values()],
+    ownershipMap,
   };
 }
 
@@ -375,6 +532,13 @@ export async function activate(ctx, options = {}) {
   if (!Array.isArray(history)) history = [];
   history = history.slice(0, MAX_HISTORY_ITEMS);
 
+  let workspaceCache = {
+    projects: [],
+    assignments: {},
+    projectless: [],
+    projectlessSet: new Set(),
+  };
+
   let catalogCache = {
     threads: [],
     ownershipMap: new Map(),
@@ -385,6 +549,14 @@ export async function activate(ctx, options = {}) {
     error: null,
   };
   let catalogRefreshPromise = null;
+
+  let archivedCache = {
+    threads: [],
+    ownershipMap: new Map(),
+    updatedAt: 0,
+    error: null,
+  };
+  let archivedRefreshPromise = null;
 
   async function loadSettings() {
     const raw = await ctx.readSettings();
@@ -399,6 +571,19 @@ export async function activate(ctx, options = {}) {
 
   async function savePendingArchives() {
     await writeJsonFileAtomic(pendingPath, pendingArchives).catch(() => undefined);
+  }
+
+  async function syncWorkspaceSnapshot() {
+    const allIds = new Set();
+    for (const t of catalogCache.threads) allIds.add(t.id);
+    for (const t of archivedCache.threads) allIds.add(t.id);
+    for (const h of history) {
+      if (typeof h?.threadId === "string") allIds.add(h.threadId);
+    }
+    const ws = await readWorkspaceMetadata(rpc, [...allIds]);
+    if (!disposed && (ws.projects.length > 0 || workspaceCache.projects.length === 0)) {
+      workspaceCache = ws;
+    }
   }
 
   function earliestPendingDueAt() {
@@ -458,7 +643,6 @@ export async function activate(ctx, options = {}) {
     const next = normalizeSettings({ ...current, ...patch });
     await ctx.writeSettings(next);
 
-    // Recalculate existing pending queue dueAt whenever graceMinutes changes.
     if (next.graceMinutes !== current.graceMinutes) {
       let dirty = false;
       for (const entry of Object.values(pendingArchives)) {
@@ -483,15 +667,14 @@ export async function activate(ctx, options = {}) {
       try {
         const online = await rpc.isOnline();
         if (!online) {
-          catalogCache = {
-            ...catalogCache,
-            hostConnected: false,
-            error: null,
-          };
+          catalogCache = { ...catalogCache, hostConnected: false, error: null };
           return catalogCache;
         }
         catalogCache.hostConnected = true;
         catalogCache.error = null;
+        if (workspaceCache.projects.length === 0) {
+          await syncWorkspaceSnapshot();
+        }
         const fresh = await readAllActiveThreads(rpc, {
           isAborted: () => disposed,
           onPage: (partial) => {
@@ -511,6 +694,7 @@ export async function activate(ctx, options = {}) {
             hostConnected: true,
             error: null,
           };
+          await syncWorkspaceSnapshot();
         }
       } catch (error) {
         if (!disposed) {
@@ -529,6 +713,60 @@ export async function activate(ctx, options = {}) {
     return task;
   }
 
+  function refreshArchivedInBackground(force = false) {
+    if (disposed) return Promise.resolve(archivedCache);
+    if (archivedRefreshPromise) return archivedRefreshPromise;
+    if (
+      !force &&
+      archivedCache.updatedAt > 0 &&
+      nowFn() - archivedCache.updatedAt < ARCHIVED_TTL_MS
+    ) {
+      return Promise.resolve(archivedCache);
+    }
+    const task = (async () => {
+      try {
+        const online = await rpc.isOnline();
+        if (!online) return archivedCache;
+        archivedCache.error = null;
+        if (workspaceCache.projects.length === 0) {
+          await syncWorkspaceSnapshot();
+        }
+        const fresh = await readAllArchivedThreads(rpc, {
+          isAborted: () => disposed,
+          onPage: (partial) => {
+            if (disposed) return;
+            archivedCache = {
+              ...partial,
+              updatedAt: nowFn(),
+              error: null,
+            };
+          },
+        });
+        if (!disposed) {
+          archivedCache = {
+            ...fresh,
+            updatedAt: nowFn(),
+            error: null,
+          };
+          await syncWorkspaceSnapshot();
+        }
+      } catch (error) {
+        if (!disposed) {
+          archivedCache = {
+            ...archivedCache,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      } finally {
+        archivedRefreshPromise = null;
+      }
+      return archivedCache;
+    })();
+    archivedRefreshPromise = task;
+    task.catch(() => undefined);
+    return task;
+  }
+
   function evaluateCachedThreads(settings) {
     const protectedSet = new Set(protectedStore.threadIds);
     const nowMs = nowFn();
@@ -542,10 +780,79 @@ export async function activate(ctx, options = {}) {
           treeNodes: catalogCache.treeNodes,
           ownershipMap: catalogCache.ownershipMap,
           pendingMap: pendingArchives,
+          workspace: workspaceCache,
         }),
       )
       .filter((item) => item.id)
       .sort((a, b) => (b.updatedAtMs ?? 0) - (a.updatedAtMs ?? 0));
+  }
+
+  function buildArchivedList() {
+    const historyById = new Map();
+    for (const h of history) {
+      if (h && typeof h.threadId === "string" && !historyById.has(h.threadId)) {
+        historyById.set(h.threadId, h);
+      }
+    }
+
+    const byId = new Map();
+    for (const thread of archivedCache.threads) {
+      const id = thread.id;
+      const hist = historyById.get(id) ?? null;
+      const ownership = archivedCache.ownershipMap.get(id);
+      const harnessId =
+        ownership?.owner === "external"
+          ? ownership.harnessId
+          : ownership?.owner === "codex"
+            ? "codex"
+            : hist?.harnessId || thread.modelProvider || "codex";
+      const updatedAtMs =
+        normalizeTimestampMs(thread.updatedAt) ??
+        normalizeTimestampMs(thread.recencyAt) ??
+        normalizeTimestampMs(thread.createdAt) ??
+        hist?.lastActivityAt ??
+        null;
+      const project = resolveThreadProject(thread, workspaceCache);
+      byId.set(id, {
+        threadId: id,
+        title: extractThreadTitle(thread),
+        cwd: thread.cwd || hist?.cwd || "",
+        projectId: project.projectId,
+        projectName: project.projectName,
+        harnessId,
+        updatedAtMs,
+        archivedAt: hist?.archivedAt ?? updatedAtMs,
+        daysInactive: hist?.daysInactive ?? null,
+        trigger: hist?.trigger ?? null,
+        isPluginArchived: Boolean(hist),
+      });
+    }
+
+    // Include plugin-recorded archived items not yet reflected in archivedCache
+    for (const hist of history) {
+      if (!hist || typeof hist.threadId !== "string" || byId.has(hist.threadId)) continue;
+      const project = resolveThreadProject(
+        { id: hist.threadId, cwd: hist.cwd || "", projectId: hist.projectId ?? null },
+        workspaceCache,
+      );
+      byId.set(hist.threadId, {
+        threadId: hist.threadId,
+        title: hist.title || hist.threadId,
+        cwd: hist.cwd || "",
+        projectId: project.projectId,
+        projectName: project.projectName,
+        harnessId: hist.harnessId || "codex",
+        updatedAtMs: hist.lastActivityAt ?? hist.archivedAt ?? null,
+        archivedAt: hist.archivedAt ?? hist.lastActivityAt ?? null,
+        daysInactive: hist.daysInactive ?? null,
+        trigger: hist.trigger ?? "auto",
+        isPluginArchived: true,
+      });
+    }
+
+    return [...byId.values()]
+      .sort((a, b) => (b.archivedAt ?? b.updatedAtMs ?? 0) - (a.archivedAt ?? a.updatedAtMs ?? 0))
+      .slice(0, MAX_ARCHIVED_RETURN);
   }
 
   async function executeSweep({
@@ -580,7 +887,6 @@ export async function activate(ctx, options = {}) {
       const runTime = nowFn();
       const graceMs = settings.graceMinutes * MINUTE_MS;
 
-      // Prune stale pending entries that are no longer eligible (protected, reactivated, pinned, archived, running).
       let pendingDirty = false;
       for (const id of Object.keys(pendingArchives)) {
         if (!eligibleIds.has(id)) {
@@ -593,7 +899,7 @@ export async function activate(ctx, options = {}) {
       const newlyQueued = [];
 
       if (dryRun) {
-        // Dry-run does not mutate pending queue or archive anything.
+        // No side effects during dry-run.
       } else if (respectGrace && graceMs > 0) {
         for (const item of candidates) {
           const existing = pendingArchives[item.id];
@@ -634,7 +940,6 @@ export async function activate(ctx, options = {}) {
       if (!dryRun) {
         for (const item of toArchiveNow) {
           if (disposed) break;
-          // Final safety check right before archiving in case user protected it mid-sweep.
           if (protectedStore.threadIds.includes(item.id)) {
             if (pendingArchives[item.id]) {
               delete pendingArchives[item.id];
@@ -655,6 +960,7 @@ export async function activate(ctx, options = {}) {
               title: item.title,
               harnessId: item.harnessId,
               cwd: item.cwd,
+              projectId: item.projectId,
               archivedAt: nowFn(),
               lastActivityAt: item.updatedAtMs,
               daysInactive: item.daysInactive,
@@ -819,16 +1125,20 @@ export async function activate(ctx, options = {}) {
     const items = evaluateCachedThreads(settings);
     const expiring = items.filter((item) => item.eligible);
     const pendingItems = expiring.filter((item) => item.pendingDueAt !== null);
+    const archivedItems = buildArchivedList();
     return {
       pid: process.pid,
       nowMs: nowFn(),
       settings,
       protectedThreadIds: protectedStore.threadIds,
       protectedMeta: protectedStore.meta,
+      projects: workspaceCache.projects.map(({ id, name }) => ({ id, name })),
       hostConnected: online,
       hostError: catalogCache.error,
       refreshing: Boolean(catalogRefreshPromise),
+      archivedRefreshing: Boolean(archivedRefreshPromise),
       catalogUpdatedAt: catalogCache.updatedAt || null,
+      archivedUpdatedAt: archivedCache.updatedAt || null,
       sweeping,
       sweepProgress,
       lastRunAt,
@@ -840,6 +1150,7 @@ export async function activate(ctx, options = {}) {
         expiredCount: expiring.length,
         pendingCount: pendingItems.length,
         protectedActiveCount: items.filter((item) => item.isProtected).length,
+        archivedCount: archivedItems.length,
         expiringPreview: expiring.slice(0, 12),
       },
       history,
@@ -861,11 +1172,38 @@ export async function activate(ctx, options = {}) {
     return {
       settings,
       protectedThreadIds: protectedStore.threadIds,
+      projects: workspaceCache.projects.map(({ id, name }) => ({ id, name })),
       hostConnected: online,
       hostError: catalogCache.error,
       refreshing: Boolean(catalogRefreshPromise),
       catalogUpdatedAt: catalogCache.updatedAt || null,
       threads: items,
+      nowMs: nowFn(),
+    };
+  });
+
+  ctx.handle("listArchived", async (params) => {
+    const forceRefresh = Boolean(params?.refresh);
+    const syncWait = Boolean(params?.sync);
+    const online = await rpc.isOnline();
+    if (
+      online &&
+      (forceRefresh ||
+        archivedCache.updatedAt === 0 ||
+        nowFn() - archivedCache.updatedAt >= ARCHIVED_TTL_MS)
+    ) {
+      const task = refreshArchivedInBackground(forceRefresh);
+      if (syncWait) await task;
+    }
+    const items = buildArchivedList();
+    return {
+      projects: workspaceCache.projects.map(({ id, name }) => ({ id, name })),
+      hostConnected: online,
+      archivedError: archivedCache.error,
+      refreshing: Boolean(archivedRefreshPromise),
+      updatedAt: archivedCache.updatedAt || null,
+      archived: items,
+      pluginHistoryCount: history.length,
       nowMs: nowFn(),
     };
   });
@@ -963,6 +1301,10 @@ export async function activate(ctx, options = {}) {
     if (!threadId) throw new Error("threadId is required");
     await rpc.request("thread/unarchive", { threadId });
     history = history.filter((item) => item.threadId !== threadId);
+    archivedCache = {
+      ...archivedCache,
+      threads: archivedCache.threads.filter((t) => t.id !== threadId),
+    };
     await writeJsonFileAtomic(historyPath, history).catch(() => undefined);
     if (params?.protect) {
       const set = new Set(protectedStore.threadIds);
