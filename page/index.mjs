@@ -33,8 +33,10 @@ export async function mount(root, api) {
     threads: [],
     history: [],
     loading: true,
+    refreshing: false,
     saving: false,
     sweeping: false,
+    sweepProgress: null,
     activeTab: "sessions",
     filter: "all",
     search: "",
@@ -45,6 +47,20 @@ export async function mount(root, api) {
 
   let bannerTimer = null;
   let refreshTimer = null;
+  let fastPollTimer = null;
+
+  function scheduleFastPoll(active) {
+    if (fastPollTimer !== null) {
+      clearTimeout(fastPollTimer);
+      fastPollTimer = null;
+    }
+    if (active && !api.signal.aborted) {
+      fastPollTimer = setTimeout(() => {
+        fastPollTimer = null;
+        void refreshAll(true, false);
+      }, 1500);
+    }
+  }
 
   function showBanner(text, tone = "info") {
     if (bannerTimer !== null) clearTimeout(bannerTimer);
@@ -58,16 +74,17 @@ export async function mount(root, api) {
     }, 4500);
   }
 
-  async function refreshAll(silent = false) {
+  async function refreshAll(silent = false, forceRefresh = false) {
     if (api.signal.aborted) return;
     if (!silent) {
       state.loading = true;
       render();
     }
+    const wasSweeping = state.sweeping;
     try {
       const [backendState, threadList] = await Promise.all([
-        api.backend.invoke("getState"),
-        api.backend.invoke("listThreads").catch(() => null),
+        api.backend.invoke("getState", forceRefresh ? { refresh: true } : undefined),
+        api.backend.invoke("listThreads", forceRefresh ? { refresh: true } : undefined).catch(() => null),
       ]);
       if (api.signal.aborted) return;
       if (backendState && typeof backendState === "object") {
@@ -75,22 +92,38 @@ export async function mount(root, api) {
         state.protectedThreadIds = normalizeProtectedIds(backendState.protectedThreadIds);
         state.hostConnected = Boolean(backendState.hostConnected);
         state.hostError = backendState.hostError ?? null;
+        state.refreshing = Boolean(backendState.refreshing);
+        state.sweeping = Boolean(backendState.sweeping);
+        state.sweepProgress = backendState.sweepProgress ?? null;
         state.lastRunAt = backendState.lastRunAt ?? null;
         state.nextRunAt = backendState.nextRunAt ?? null;
         state.stats = backendState.stats ?? state.stats;
         state.history = Array.isArray(backendState.history) ? backendState.history : [];
+        if (wasSweeping && !state.sweeping && backendState.lastSummary) {
+          const msg = createMessages(locale);
+          showBanner(
+            msg.sweepDone(
+              backendState.lastSummary.archivedCount ?? 0,
+              backendState.lastSummary.failedCount ?? 0,
+            ),
+            "success",
+          );
+        }
       }
       if (threadList && Array.isArray(threadList.threads)) {
         state.threads = threadList.threads;
+        state.refreshing = state.refreshing || Boolean(threadList.refreshing);
         state.stats = {
           totalActive: threadList.threads.length,
           expiredCount: threadList.threads.filter((item) => item.eligible).length,
           protectedActiveCount: threadList.threads.filter((item) => item.isProtected).length,
         };
       }
+      scheduleFastPoll(state.refreshing || state.sweeping);
     } catch (error) {
       state.hostConnected = false;
       state.hostError = error instanceof Error ? error.message : String(error);
+      scheduleFastPoll(false);
     } finally {
       state.loading = false;
       if (!api.signal.aborted) render();
@@ -141,17 +174,19 @@ export async function mount(root, api) {
     render();
     const msg = createMessages(locale);
     try {
-      const result = await api.backend.invoke("runSweep", { dryRun });
       if (dryRun) {
+        const result = await api.backend.invoke("runSweep", { dryRun: true, async: true });
+        state.sweeping = false;
         showBanner(msg.dryRunResult(result?.eligibleCount ?? 0), "info");
+        await refreshAll(true, false);
       } else {
-        showBanner(msg.sweepDone(result?.archivedCount ?? 0, result?.failedCount ?? 0), "success");
+        await api.backend.invoke("runSweep", { dryRun: false, async: true });
+        scheduleFastPoll(true);
+        await refreshAll(true, false);
       }
-      await refreshAll(true);
     } catch (error) {
-      showBanner(error instanceof Error ? error.message : String(error), "danger");
-    } finally {
       state.sweeping = false;
+      showBanner(error instanceof Error ? error.message : String(error), "danger");
       if (!api.signal.aborted) render();
     }
   }
@@ -227,9 +262,24 @@ export async function mount(root, api) {
             : ""
         }
         ${
-          state.hostError
+          state.hostError && state.hostError !== state.banner
             ? `<div class="aag-banner is-danger" role="alert">${escapeHtml(state.hostError)}</div>`
             : ""
+        }
+        ${
+          state.sweepProgress
+            ? `<div class="aag-banner is-info" role="status">${escapeHtml(
+                locale.toLowerCase().startsWith("zh")
+                  ? `正在归档超期会话：${state.sweepProgress.processed} / ${state.sweepProgress.total}（成功 ${state.sweepProgress.archivedCount}）…`
+                  : `Archiving expired sessions: ${state.sweepProgress.processed} / ${state.sweepProgress.total} (${state.sweepProgress.archivedCount} archived)…`,
+              )}</div>`
+            : state.refreshing && state.threads.length === 0
+              ? `<div class="aag-banner is-info" role="status">${escapeHtml(
+                  locale.toLowerCase().startsWith("zh")
+                    ? "正在从共享 Host 同步全量会话目录…"
+                    : "Syncing full session catalog from shared Host…",
+                )}</div>`
+              : ""
         }
 
         <section class="aag-stats">
@@ -486,7 +536,7 @@ export async function mount(root, api) {
     });
 
     root.querySelector('[data-action="refresh"]')?.addEventListener("click", () => {
-      void refreshAll(false);
+      void refreshAll(false, true);
     });
 
     root.querySelector('[data-action="dryRun"]')?.addEventListener("click", () => {
@@ -596,6 +646,7 @@ export async function mount(root, api) {
     stopBroadcast();
     if (bannerTimer !== null) clearTimeout(bannerTimer);
     if (refreshTimer !== null) clearInterval(refreshTimer);
+    if (fastPollTimer !== null) clearTimeout(fastPollTimer);
     root.replaceChildren();
   };
 }

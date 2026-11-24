@@ -5,7 +5,7 @@
     "en": "Auto Archive & Keep Guard",
     "zh-CN": "自动归档与常驻保护"
   },
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": {
     "en": "Automatically archive inactive sessions older than N days while letting you mark any session as permanently protected from its More menu.",
     "zh-CN": "按设定天数自动归档长期不活跃的会话，并在每个会话的「更多」菜单中添加常驻「防止自动归档」保护开关。"

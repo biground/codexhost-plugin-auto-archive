@@ -5,8 +5,9 @@ import path from "node:path";
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MAX_CATALOG_PAGES = 50;
 const MAX_HISTORY_ITEMS = 200;
-const INITIAL_SWEEP_DELAY_MS = 20_000;
-const RPC_TIMEOUT_MS = 30_000;
+const INITIAL_SWEEP_DELAY_MS = 120_000;
+const CATALOG_TTL_MS = 45_000;
+const RPC_TIMEOUT_MS = 25_000;
 
 export const DEFAULT_SETTINGS = Object.freeze({
   enabled: true,
@@ -232,11 +233,27 @@ export function createHostRpcClient(clientHostsDir, fetchImpl = globalThis.fetch
   return { request, isOnline };
 }
 
-export async function readAllActiveThreads(rpc) {
+export async function readAllActiveThreads(rpc, options = {}) {
+  const { onPage, isAborted } = options;
   const byId = new Map();
   const ownershipMap = new Map();
+
+  // Fetch pins & tree snapshot in parallel right away so incremental pages have full guard info.
+  const [pinsResult, treeResult] = await Promise.all([
+    rpc.request("codexhost/thread/pins/list", {}).catch(() => null),
+    rpc.request("codexhost/thread/tree/snapshot", {}).catch(() => null),
+  ]);
+  const pinnedSet = new Set(
+    Array.isArray(pinsResult?.threadIds)
+      ? pinsResult.threadIds.filter((id) => typeof id === "string")
+      : [],
+  );
+  const treeNodes =
+    treeResult?.nodes && typeof treeResult.nodes === "object" ? treeResult.nodes : {};
+
   let cursor = undefined;
   for (let page = 0; page < MAX_CATALOG_PAGES; page++) {
+    if (isAborted?.()) break;
     const params = cursor
       ? { includeArchived: false, officialCursor: { live: cursor } }
       : { includeArchived: false };
@@ -254,25 +271,32 @@ export async function readAllActiveThreads(rpc) {
     for (const thread of threads) {
       if (!thread || typeof thread.id !== "string" || archivedSet.has(thread.id)) continue;
       if (!byId.has(thread.id)) {
-        byId.set(thread.id, thread);
+        // Keep only compact metadata fields so memory & IPC stay tiny even with thousands of threads.
+        byId.set(thread.id, {
+          id: thread.id,
+          name: typeof thread.name === "string" ? thread.name : null,
+          title: typeof thread.title === "string" ? thread.title : null,
+          preview: typeof thread.preview === "string" ? thread.preview.slice(0, 200) : null,
+          cwd: typeof thread.cwd === "string" ? thread.cwd : "",
+          modelProvider: typeof thread.modelProvider === "string" ? thread.modelProvider : null,
+          createdAt: thread.createdAt ?? null,
+          updatedAt: thread.updatedAt ?? null,
+          recencyAt: thread.recencyAt ?? null,
+          status: thread.status ?? null,
+          isPinned: Boolean(thread.isPinned),
+        });
       }
     }
+    onPage?.({
+      threads: [...byId.values()],
+      ownershipMap: new Map(ownershipMap),
+      pinnedSet,
+      treeNodes,
+    });
     const nextCursor = result?.officialCursor?.live ?? null;
     if (!nextCursor || nextCursor === cursor) break;
     cursor = nextCursor;
   }
-
-  const [pinsResult, treeResult] = await Promise.all([
-    rpc.request("codexhost/thread/pins/list", {}).catch(() => null),
-    rpc.request("codexhost/thread/tree/snapshot", {}).catch(() => null),
-  ]);
-  const pinnedSet = new Set(
-    Array.isArray(pinsResult?.threadIds)
-      ? pinsResult.threadIds.filter((id) => typeof id === "string")
-      : [],
-  );
-  const treeNodes =
-    treeResult?.nodes && typeof treeResult.nodes === "object" ? treeResult.nodes : {};
 
   return {
     threads: [...byId.values()],
@@ -307,14 +331,27 @@ export async function activate(ctx, options = {}) {
 
   let disposed = false;
   let sweeping = false;
+  let sweepProgress = null;
   let timer = null;
   let nextRunAt = null;
   let lastRunAt = null;
   let lastSummary = null;
   let protectedStore = normalizeProtectedStore(await readJsonFile(protectedPath, null));
-  let history = (await readJsonFile(historyPath, []));
+  let history = await readJsonFile(historyPath, []);
   if (!Array.isArray(history)) history = [];
   history = history.slice(0, MAX_HISTORY_ITEMS);
+
+  // Non-blocking catalog cache so every backend.invoke returns in < 20ms (well under Host's 10s IPC timeout).
+  let catalogCache = {
+    threads: [],
+    ownershipMap: new Map(),
+    pinnedSet: new Set(),
+    treeNodes: {},
+    updatedAt: 0,
+    hostConnected: false,
+    error: null,
+  };
+  let catalogRefreshPromise = null;
 
   async function loadSettings() {
     const raw = await ctx.readSettings();
@@ -324,7 +361,6 @@ export async function activate(ctx, options = {}) {
   async function saveSettings(patch) {
     const current = await loadSettings();
     const next = normalizeSettings({ ...current, ...patch });
-    // Only write schema-declared keys so strict settingsSchema validation succeeds.
     await ctx.writeSettings(next);
     scheduleNext(next);
     return next;
@@ -336,28 +372,82 @@ export async function activate(ctx, options = {}) {
     return protectedStore;
   }
 
-  async function inspectThreads(settingsOverride) {
-    const settings = settingsOverride ?? (await loadSettings());
-    const catalog = await readAllActiveThreads(rpc);
+  function refreshCatalogInBackground(force = false) {
+    if (disposed) return Promise.resolve(catalogCache);
+    if (catalogRefreshPromise) return catalogRefreshPromise;
+    if (!force && catalogCache.updatedAt > 0 && nowFn() - catalogCache.updatedAt < CATALOG_TTL_MS) {
+      return Promise.resolve(catalogCache);
+    }
+    const task = (async () => {
+      try {
+        const online = await rpc.isOnline();
+        if (!online) {
+          catalogCache = {
+            ...catalogCache,
+            hostConnected: false,
+            error: null,
+          };
+          return catalogCache;
+        }
+        catalogCache.hostConnected = true;
+        catalogCache.error = null;
+        const fresh = await readAllActiveThreads(rpc, {
+          isAborted: () => disposed,
+          onPage: (partial) => {
+            if (disposed) return;
+            catalogCache = {
+              ...partial,
+              updatedAt: nowFn(),
+              hostConnected: true,
+              error: null,
+            };
+          },
+        });
+        if (!disposed) {
+          catalogCache = {
+            ...fresh,
+            updatedAt: nowFn(),
+            hostConnected: true,
+            error: null,
+          };
+        }
+      } catch (error) {
+        if (!disposed) {
+          catalogCache = {
+            ...catalogCache,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      } finally {
+        catalogRefreshPromise = null;
+      }
+      return catalogCache;
+    })();
+    catalogRefreshPromise = task;
+    // Prevent unhandled rejection under --unhandled-rejections=strict.
+    task.catch(() => undefined);
+    return task;
+  }
+
+  function evaluateCachedThreads(settings) {
     const protectedSet = new Set(protectedStore.threadIds);
     const nowMs = nowFn();
-    const items = catalog.threads
+    return catalogCache.threads
       .map((thread) =>
         evaluateThread(thread, {
           nowMs,
           settings,
           protectedSet,
-          pinnedSet: catalog.pinnedSet,
-          treeNodes: catalog.treeNodes,
-          ownershipMap: catalog.ownershipMap,
+          pinnedSet: catalogCache.pinnedSet,
+          treeNodes: catalogCache.treeNodes,
+          ownershipMap: catalogCache.ownershipMap,
         }),
       )
       .filter((item) => item.id)
       .sort((a, b) => (b.updatedAtMs ?? 0) - (a.updatedAtMs ?? 0));
-    return { settings, items };
   }
 
-  async function runSweep({ dryRun = false, trigger = "manual" } = {}) {
+  async function executeSweep({ dryRun = false, trigger = "manual", refresh = true } = {}) {
     if (sweeping) {
       return {
         busy: true,
@@ -370,17 +460,37 @@ export async function activate(ctx, options = {}) {
     }
     sweeping = true;
     try {
-      const { settings, items } = await inspectThreads();
+      const settings = await loadSettings();
+      if (refresh || catalogCache.updatedAt === 0) {
+        await refreshCatalogInBackground(true);
+      }
+      if (!catalogCache.hostConnected) {
+        throw new Error(catalogCache.error || "Shared CodexHost client channel is unavailable");
+      }
+      const items = evaluateCachedThreads(settings);
       const candidates = items.filter((item) => item.eligible);
       const archived = [];
       const failed = [];
+      const archivedIdSet = new Set();
       const runTime = nowFn();
+
+      sweepProgress = dryRun
+        ? null
+        : {
+            trigger,
+            startedAt: runTime,
+            total: candidates.length,
+            processed: 0,
+            archivedCount: 0,
+            failedCount: 0,
+          };
 
       if (!dryRun) {
         for (const item of candidates) {
           if (disposed) break;
           try {
             await rpc.request("thread/archive", { threadId: item.id });
+            archivedIdSet.add(item.id);
             const record = {
               threadId: item.id,
               title: item.title,
@@ -393,15 +503,24 @@ export async function activate(ctx, options = {}) {
               trigger,
             };
             archived.push(record);
+            if (sweepProgress) sweepProgress.archivedCount = archived.length;
           } catch (error) {
             failed.push({
               threadId: item.id,
               title: item.title,
               error: error instanceof Error ? error.message : String(error),
             });
+            if (sweepProgress) sweepProgress.failedCount = failed.length;
           }
+          if (sweepProgress) sweepProgress.processed += 1;
         }
         if (archived.length > 0) {
+          // Immediately remove archived threads from the local catalog cache so UI updates cleanly.
+          catalogCache = {
+            ...catalogCache,
+            threads: catalogCache.threads.filter((t) => !archivedIdSet.has(t.id)),
+            updatedAt: nowFn(),
+          };
           history = [...archived, ...history].slice(0, MAX_HISTORY_ITEMS);
           await writeJsonFileAtomic(historyPath, history).catch(() => undefined);
         }
@@ -447,6 +566,7 @@ export async function activate(ctx, options = {}) {
       throw error;
     } finally {
       sweeping = false;
+      sweepProgress = null;
     }
   }
 
@@ -468,20 +588,26 @@ export async function activate(ctx, options = {}) {
         ? delayOverrideMs
         : settings.checkIntervalMinutes * 60_000;
     nextRunAt = nowFn() + delayMs;
-    timer = setTimeout(async () => {
+    timer = setTimeout(() => {
       timer = null;
       if (disposed) return;
-      let latest;
-      try {
-        latest = await loadSettings();
-        if (latest.enabled) {
-          await runSweep({ dryRun: false, trigger: "auto" }).catch(() => undefined);
+      void (async () => {
+        let latest = settings;
+        try {
+          latest = await loadSettings();
+          if (latest.enabled) {
+            await executeSweep({ dryRun: false, trigger: "auto", refresh: true }).catch(
+              () => undefined,
+            );
+          }
+        } catch {
+          // Never allow timer callbacks to trigger unhandled rejections.
+        } finally {
+          if (!disposed) {
+            scheduleNext(latest);
+          }
         }
-      } finally {
-        if (!disposed) {
-          scheduleNext(latest ?? settings);
-        }
-      }
+      })();
     }, delayMs);
     timer.unref?.();
   }
@@ -489,6 +615,8 @@ export async function activate(ctx, options = {}) {
   const initialSettings = await loadSettings();
   if (options.autoSchedule !== false) {
     scheduleNext(initialSettings, INITIAL_SWEEP_DELAY_MS);
+    // Warm up the catalog cache asynchronously right after activation without blocking activate().
+    void refreshCatalogInBackground(true);
   }
 
   ctx.handle("getProtected", async () => ({
@@ -496,52 +624,63 @@ export async function activate(ctx, options = {}) {
     protectedMeta: protectedStore.meta,
   }));
 
-  ctx.handle("getState", async () => {
+  ctx.handle("getState", async (params) => {
     const settings = await loadSettings();
-    scheduleNext(settings, nextRunAt ? Math.max(5_000, nextRunAt - nowFn()) : undefined);
-    const hostConnected = await rpc.isOnline();
-    let stats = {
-      totalActive: 0,
-      expiredCount: 0,
-      protectedActiveCount: 0,
-      expiringPreview: [],
-    };
-    let hostError = null;
-    if (hostConnected) {
-      try {
-        const { items } = await inspectThreads(settings);
-        const expiring = items.filter((item) => item.eligible);
-        stats = {
-          totalActive: items.length,
-          expiredCount: expiring.length,
-          protectedActiveCount: items.filter((item) => item.isProtected).length,
-          expiringPreview: expiring.slice(0, 12),
-        };
-      } catch (error) {
-        hostError = error instanceof Error ? error.message : String(error);
-      }
+    if (settings.enabled && nextRunAt === null && options.autoSchedule !== false) {
+      scheduleNext(settings);
+    } else if (!settings.enabled && nextRunAt !== null) {
+      scheduleNext(settings);
     }
+
+    const forceRefresh = Boolean(params?.refresh);
+    const online = await rpc.isOnline();
+    catalogCache.hostConnected = online;
+    if (online && (forceRefresh || catalogCache.updatedAt === 0 || nowFn() - catalogCache.updatedAt >= CATALOG_TTL_MS)) {
+      void refreshCatalogInBackground(forceRefresh);
+    }
+
+    const items = evaluateCachedThreads(settings);
+    const expiring = items.filter((item) => item.eligible);
     return {
       pid: process.pid,
       settings,
       protectedThreadIds: protectedStore.threadIds,
       protectedMeta: protectedStore.meta,
-      hostConnected,
-      hostError,
+      hostConnected: online,
+      hostError: catalogCache.error,
+      refreshing: Boolean(catalogRefreshPromise),
+      catalogUpdatedAt: catalogCache.updatedAt || null,
       sweeping,
+      sweepProgress,
       lastRunAt,
       nextRunAt,
       lastSummary,
-      stats,
+      stats: {
+        totalActive: items.length,
+        expiredCount: expiring.length,
+        protectedActiveCount: items.filter((item) => item.isProtected).length,
+        expiringPreview: expiring.slice(0, 12),
+      },
       history,
     };
   });
 
-  ctx.handle("listThreads", async () => {
-    const { settings, items } = await inspectThreads();
+  ctx.handle("listThreads", async (params) => {
+    const settings = await loadSettings();
+    const forceRefresh = Boolean(params?.refresh);
+    const online = await rpc.isOnline();
+    catalogCache.hostConnected = online;
+    if (online && (forceRefresh || catalogCache.updatedAt === 0 || nowFn() - catalogCache.updatedAt >= CATALOG_TTL_MS)) {
+      void refreshCatalogInBackground(forceRefresh);
+    }
+    const items = evaluateCachedThreads(settings);
     return {
       settings,
       protectedThreadIds: protectedStore.threadIds,
+      hostConnected: online,
+      hostError: catalogCache.error,
+      refreshing: Boolean(catalogRefreshPromise),
+      catalogUpdatedAt: catalogCache.updatedAt || null,
       threads: items,
       nowMs: nowFn(),
     };
@@ -584,7 +723,42 @@ export async function activate(ctx, options = {}) {
 
   ctx.handle("runSweep", async (params) => {
     const dryRun = Boolean(params?.dryRun);
-    return runSweep({ dryRun, trigger: "manual" });
+    const asyncMode = Boolean(params?.async);
+    if (dryRun) {
+      // Fast dry-run directly from cache (or await quick refresh only if cache is empty and synchronous).
+      const settings = await loadSettings();
+      if (catalogCache.updatedAt === 0 && !asyncMode) {
+        await refreshCatalogInBackground(true);
+      } else if (catalogCache.hostConnected) {
+        void refreshCatalogInBackground(true);
+      }
+      const items = evaluateCachedThreads(settings);
+      const candidates = items.filter((item) => item.eligible);
+      return {
+        ranAt: nowFn(),
+        dryRun: true,
+        trigger: "manual",
+        scannedCount: items.length,
+        protectedCount: items.filter((item) => item.isProtected).length,
+        eligibleCount: candidates.length,
+        archivedCount: 0,
+        failedCount: 0,
+        error: null,
+        candidates,
+        archived: [],
+        failed: [],
+      };
+    }
+    if (asyncMode) {
+      if (sweeping) {
+        return { started: false, busy: true, sweepProgress };
+      }
+      void executeSweep({ dryRun: false, trigger: "manual", refresh: false }).catch(
+        () => undefined,
+      );
+      return { started: true, busy: false, sweepProgress };
+    }
+    return executeSweep({ dryRun: false, trigger: "manual", refresh: true });
   });
 
   ctx.handle("unarchiveThread", async (params) => {
@@ -605,6 +779,7 @@ export async function activate(ctx, options = {}) {
       };
       await saveProtectedStore({ threadIds: [...set], meta });
     }
+    void refreshCatalogInBackground(true);
     return {
       threadId,
       restored: true,

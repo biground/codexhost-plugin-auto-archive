@@ -1,6 +1,6 @@
 {
   "name": "codexhost-auto-archive-guard",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "description": "CodexHost unified extension (manifestVersion 2): auto-archive inactive sessions after N days and add a persistent Keep from Auto-Archive option in every session's More menu.",

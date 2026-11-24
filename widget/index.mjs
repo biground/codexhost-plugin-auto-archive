@@ -84,9 +84,9 @@ export async function mount(root, api) {
     render();
     const msg = createMessages(locale);
     try {
-      const result = await api.backend.invoke("runSweep", { dryRun: false });
-      setNotice(msg.sweepDone(result?.archivedCount ?? 0, result?.failedCount ?? 0));
-      await syncState();
+      await api.backend.invoke("runSweep", { dryRun: false, async: true });
+      setNotice(locale.toLowerCase().startsWith("zh") ? "已开始后台归档超期会话…" : "Archiving expired sessions…");
+      setTimeout(() => void syncState(), 2000);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
     } finally {
