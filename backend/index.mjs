@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import path from "node:path";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const MINUTE_MS = 60 * 1000;
 const MAX_CATALOG_PAGES = 50;
 const MAX_HISTORY_ITEMS = 200;
 const INITIAL_SWEEP_DELAY_MS = 120_000;
@@ -11,9 +12,10 @@ const RPC_TIMEOUT_MS = 25_000;
 
 export const DEFAULT_SETTINGS = Object.freeze({
   enabled: true,
-  retentionDays: 30,
+  retentionDays: 3,
   dateField: "updatedAt",
-  checkIntervalMinutes: 30,
+  checkIntervalMinutes: 1440,
+  graceMinutes: 30,
   skipPinned: true,
   showWidget: true,
 });
@@ -28,8 +30,12 @@ export function normalizeSettings(raw) {
   const dateField = source.dateField === "createdAt" ? "createdAt" : "updatedAt";
   const rawInterval = Number(source.checkIntervalMinutes);
   const checkIntervalMinutes = Number.isFinite(rawInterval)
-    ? Math.max(5, Math.min(1440, Math.round(rawInterval)))
+    ? Math.max(5, Math.min(10080, Math.round(rawInterval)))
     : DEFAULT_SETTINGS.checkIntervalMinutes;
+  const rawGrace = Number(source.graceMinutes);
+  const graceMinutes = Number.isFinite(rawGrace)
+    ? Math.max(0, Math.min(10080, Math.round(rawGrace)))
+    : DEFAULT_SETTINGS.graceMinutes;
   const skipPinned =
     typeof source.skipPinned === "boolean" ? source.skipPinned : DEFAULT_SETTINGS.skipPinned;
   const showWidget =
@@ -39,6 +45,7 @@ export function normalizeSettings(raw) {
     retentionDays,
     dateField,
     checkIntervalMinutes,
+    graceMinutes,
     skipPinned,
     showWidget,
   };
@@ -68,6 +75,25 @@ export function normalizeProtectedStore(raw) {
     }
   }
   return { threadIds: [...ids], meta };
+}
+
+export function normalizePendingStore(raw) {
+  const result = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return result;
+  for (const [id, entry] of Object.entries(raw)) {
+    if (typeof id !== "string" || !id.trim()) continue;
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const detectedAt = Number(entry.detectedAt);
+    const dueAt = Number(entry.dueAt);
+    if (!Number.isFinite(detectedAt) || !Number.isFinite(dueAt)) continue;
+    result[id.trim()] = {
+      threadId: id.trim(),
+      detectedAt,
+      dueAt,
+      title: typeof entry.title === "string" ? entry.title.slice(0, 200) : "",
+    };
+  }
+  return result;
 }
 
 export function normalizeTimestampMs(value) {
@@ -117,7 +143,8 @@ export function extractThreadTitle(thread) {
 }
 
 export function evaluateThread(thread, options) {
-  const { nowMs, settings, protectedSet, pinnedSet, treeNodes, ownershipMap } = options;
+  const { nowMs, settings, protectedSet, pinnedSet, treeNodes, ownershipMap, pendingMap = {} } =
+    options;
   const id = typeof thread?.id === "string" ? thread.id : "";
   const updatedAtMs =
     normalizeTimestampMs(thread?.updatedAt) ??
@@ -149,6 +176,9 @@ export function evaluateThread(thread, options) {
   else if (isRunning) skipReason = "running";
   else if (settings.skipPinned && isPinned) skipReason = "pinned";
 
+  const eligible = Boolean(id) && isExpired && skipReason === null;
+  const pending = eligible ? pendingMap[id] ?? null : null;
+
   return {
     id,
     title: extractThreadTitle(thread),
@@ -162,8 +192,10 @@ export function evaluateThread(thread, options) {
     isPinned,
     isRunning,
     isExpired,
-    eligible: Boolean(id) && isExpired && skipReason === null,
+    eligible,
     skipReason,
+    pendingDetectedAt: pending ? pending.detectedAt : null,
+    pendingDueAt: pending ? pending.dueAt : null,
   };
 }
 
@@ -238,7 +270,6 @@ export async function readAllActiveThreads(rpc, options = {}) {
   const byId = new Map();
   const ownershipMap = new Map();
 
-  // Fetch pins & tree snapshot in parallel right away so incremental pages have full guard info.
   const [pinsResult, treeResult] = await Promise.all([
     rpc.request("codexhost/thread/pins/list", {}).catch(() => null),
     rpc.request("codexhost/thread/tree/snapshot", {}).catch(() => null),
@@ -271,7 +302,6 @@ export async function readAllActiveThreads(rpc, options = {}) {
     for (const thread of threads) {
       if (!thread || typeof thread.id !== "string" || archivedSet.has(thread.id)) continue;
       if (!byId.has(thread.id)) {
-        // Keep only compact metadata fields so memory & IPC stay tiny even with thousands of threads.
         byId.set(thread.id, {
           id: thread.id,
           name: typeof thread.name === "string" ? thread.name : null,
@@ -327,21 +357,24 @@ export async function activate(ctx, options = {}) {
   const rpc = options.rpc ?? createHostRpcClient(clientHostsDir, options.fetchImpl);
   const nowFn = options.now ?? (() => Date.now());
   const protectedPath = path.join(ctx.dataDir, "protected-threads.json");
+  const pendingPath = path.join(ctx.dataDir, "pending-archives.json");
   const historyPath = path.join(ctx.dataDir, "archive-history.json");
 
   let disposed = false;
   let sweeping = false;
   let sweepProgress = null;
-  let timer = null;
+  let scanTimer = null;
+  let pendingTimer = null;
   let nextRunAt = null;
+  let nextPendingDueAt = null;
   let lastRunAt = null;
   let lastSummary = null;
   let protectedStore = normalizeProtectedStore(await readJsonFile(protectedPath, null));
+  let pendingArchives = normalizePendingStore(await readJsonFile(pendingPath, null));
   let history = await readJsonFile(historyPath, []);
   if (!Array.isArray(history)) history = [];
   history = history.slice(0, MAX_HISTORY_ITEMS);
 
-  // Non-blocking catalog cache so every backend.invoke returns in < 20ms (well under Host's 10s IPC timeout).
   let catalogCache = {
     threads: [],
     ownershipMap: new Map(),
@@ -358,18 +391,86 @@ export async function activate(ctx, options = {}) {
     return normalizeSettings(raw);
   }
 
-  async function saveSettings(patch) {
-    const current = await loadSettings();
-    const next = normalizeSettings({ ...current, ...patch });
-    await ctx.writeSettings(next);
-    scheduleNext(next);
-    return next;
-  }
-
   async function saveProtectedStore(nextStore) {
     protectedStore = normalizeProtectedStore(nextStore);
     await writeJsonFileAtomic(protectedPath, protectedStore);
     return protectedStore;
+  }
+
+  async function savePendingArchives() {
+    await writeJsonFileAtomic(pendingPath, pendingArchives).catch(() => undefined);
+  }
+
+  function earliestPendingDueAt() {
+    let earliest = null;
+    for (const entry of Object.values(pendingArchives)) {
+      if (earliest === null || entry.dueAt < earliest) {
+        earliest = entry.dueAt;
+      }
+    }
+    return earliest;
+  }
+
+  function clearPendingTimer() {
+    if (pendingTimer !== null) {
+      clearTimeout(pendingTimer);
+      pendingTimer = null;
+    }
+  }
+
+  function schedulePendingFlush(settings) {
+    clearPendingTimer();
+    const earliest = earliestPendingDueAt();
+    nextPendingDueAt = settings.enabled ? earliest : null;
+    if (disposed || !settings.enabled || earliest === null) {
+      return;
+    }
+    const delayMs = Math.max(1_000, earliest - nowFn());
+    pendingTimer = setTimeout(() => {
+      pendingTimer = null;
+      if (disposed) return;
+      void (async () => {
+        let latest = settings;
+        try {
+          latest = await loadSettings();
+          if (latest.enabled) {
+            await executeSweep({
+              dryRun: false,
+              trigger: "auto",
+              refresh: true,
+              respectGrace: true,
+            }).catch(() => undefined);
+          }
+        } catch {
+          // Never allow timer callbacks to trigger unhandled rejections.
+        } finally {
+          if (!disposed) {
+            schedulePendingFlush(latest);
+          }
+        }
+      })();
+    }, delayMs);
+    pendingTimer.unref?.();
+  }
+
+  async function saveSettings(patch) {
+    const current = await loadSettings();
+    const next = normalizeSettings({ ...current, ...patch });
+    await ctx.writeSettings(next);
+
+    // Recalculate existing pending queue dueAt whenever graceMinutes changes.
+    if (next.graceMinutes !== current.graceMinutes) {
+      let dirty = false;
+      for (const entry of Object.values(pendingArchives)) {
+        entry.dueAt = entry.detectedAt + next.graceMinutes * MINUTE_MS;
+        dirty = true;
+      }
+      if (dirty) await savePendingArchives();
+    }
+
+    scheduleNext(next);
+    schedulePendingFlush(next);
+    return next;
   }
 
   function refreshCatalogInBackground(force = false) {
@@ -424,7 +525,6 @@ export async function activate(ctx, options = {}) {
       return catalogCache;
     })();
     catalogRefreshPromise = task;
-    // Prevent unhandled rejection under --unhandled-rejections=strict.
     task.catch(() => undefined);
     return task;
   }
@@ -441,19 +541,26 @@ export async function activate(ctx, options = {}) {
           pinnedSet: catalogCache.pinnedSet,
           treeNodes: catalogCache.treeNodes,
           ownershipMap: catalogCache.ownershipMap,
+          pendingMap: pendingArchives,
         }),
       )
       .filter((item) => item.id)
       .sort((a, b) => (b.updatedAtMs ?? 0) - (a.updatedAtMs ?? 0));
   }
 
-  async function executeSweep({ dryRun = false, trigger = "manual", refresh = true } = {}) {
+  async function executeSweep({
+    dryRun = false,
+    trigger = "manual",
+    refresh = true,
+    respectGrace = trigger === "auto",
+  } = {}) {
     if (sweeping) {
       return {
         busy: true,
         dryRun,
         trigger,
         archived: [],
+        queued: [],
         failed: [],
         candidates: [],
       };
@@ -469,28 +576,80 @@ export async function activate(ctx, options = {}) {
       }
       const items = evaluateCachedThreads(settings);
       const candidates = items.filter((item) => item.eligible);
+      const eligibleIds = new Set(candidates.map((item) => item.id));
+      const runTime = nowFn();
+      const graceMs = settings.graceMinutes * MINUTE_MS;
+
+      // Prune stale pending entries that are no longer eligible (protected, reactivated, pinned, archived, running).
+      let pendingDirty = false;
+      for (const id of Object.keys(pendingArchives)) {
+        if (!eligibleIds.has(id)) {
+          delete pendingArchives[id];
+          pendingDirty = true;
+        }
+      }
+
+      const toArchiveNow = [];
+      const newlyQueued = [];
+
+      if (dryRun) {
+        // Dry-run does not mutate pending queue or archive anything.
+      } else if (respectGrace && graceMs > 0) {
+        for (const item of candidates) {
+          const existing = pendingArchives[item.id];
+          if (!existing) {
+            const entry = {
+              threadId: item.id,
+              detectedAt: runTime,
+              dueAt: runTime + graceMs,
+              title: item.title,
+            };
+            pendingArchives[item.id] = entry;
+            newlyQueued.push(entry);
+            pendingDirty = true;
+          } else if (runTime >= existing.dueAt) {
+            toArchiveNow.push(item);
+          }
+        }
+      } else {
+        toArchiveNow.push(...candidates);
+      }
+
       const archived = [];
       const failed = [];
       const archivedIdSet = new Set();
-      const runTime = nowFn();
 
-      sweepProgress = dryRun
-        ? null
-        : {
-            trigger,
-            startedAt: runTime,
-            total: candidates.length,
-            processed: 0,
-            archivedCount: 0,
-            failedCount: 0,
-          };
+      sweepProgress =
+        dryRun || toArchiveNow.length === 0
+          ? null
+          : {
+              trigger,
+              startedAt: runTime,
+              total: toArchiveNow.length,
+              processed: 0,
+              archivedCount: 0,
+              failedCount: 0,
+            };
 
       if (!dryRun) {
-        for (const item of candidates) {
+        for (const item of toArchiveNow) {
           if (disposed) break;
+          // Final safety check right before archiving in case user protected it mid-sweep.
+          if (protectedStore.threadIds.includes(item.id)) {
+            if (pendingArchives[item.id]) {
+              delete pendingArchives[item.id];
+              pendingDirty = true;
+            }
+            if (sweepProgress) sweepProgress.processed += 1;
+            continue;
+          }
           try {
             await rpc.request("thread/archive", { threadId: item.id });
             archivedIdSet.add(item.id);
+            if (pendingArchives[item.id]) {
+              delete pendingArchives[item.id];
+              pendingDirty = true;
+            }
             const record = {
               threadId: item.id,
               title: item.title,
@@ -500,6 +659,7 @@ export async function activate(ctx, options = {}) {
               lastActivityAt: item.updatedAtMs,
               daysInactive: item.daysInactive,
               retentionDays: settings.retentionDays,
+              graceMinutes: settings.graceMinutes,
               trigger,
             };
             archived.push(record);
@@ -514,8 +674,10 @@ export async function activate(ctx, options = {}) {
           }
           if (sweepProgress) sweepProgress.processed += 1;
         }
+        if (pendingDirty) {
+          await savePendingArchives();
+        }
         if (archived.length > 0) {
-          // Immediately remove archived threads from the local catalog cache so UI updates cleanly.
           catalogCache = {
             ...catalogCache,
             threads: catalogCache.threads.filter((t) => !archivedIdSet.has(t.id)),
@@ -524,6 +686,7 @@ export async function activate(ctx, options = {}) {
           history = [...archived, ...history].slice(0, MAX_HISTORY_ITEMS);
           await writeJsonFileAtomic(historyPath, history).catch(() => undefined);
         }
+        schedulePendingFlush(settings);
       }
 
       const summary = {
@@ -533,6 +696,8 @@ export async function activate(ctx, options = {}) {
         scannedCount: items.length,
         protectedCount: items.filter((item) => item.isProtected).length,
         eligibleCount: candidates.length,
+        queuedCount: newlyQueued.length,
+        pendingCount: Object.keys(pendingArchives).length,
         archivedCount: archived.length,
         failedCount: failed.length,
         error: null,
@@ -544,6 +709,7 @@ export async function activate(ctx, options = {}) {
       return {
         ...summary,
         candidates,
+        queued: newlyQueued,
         archived,
         failed,
       };
@@ -558,6 +724,8 @@ export async function activate(ctx, options = {}) {
           scannedCount: 0,
           protectedCount: 0,
           eligibleCount: 0,
+          queuedCount: 0,
+          pendingCount: Object.keys(pendingArchives).length,
           archivedCount: 0,
           failedCount: 0,
           error: message,
@@ -571,9 +739,9 @@ export async function activate(ctx, options = {}) {
   }
 
   function clearScheduledTimer() {
-    if (timer !== null) {
-      clearTimeout(timer);
-      timer = null;
+    if (scanTimer !== null) {
+      clearTimeout(scanTimer);
+      scanTimer = null;
     }
   }
 
@@ -586,36 +754,40 @@ export async function activate(ctx, options = {}) {
     const delayMs =
       typeof delayOverrideMs === "number"
         ? delayOverrideMs
-        : settings.checkIntervalMinutes * 60_000;
+        : settings.checkIntervalMinutes * MINUTE_MS;
     nextRunAt = nowFn() + delayMs;
-    timer = setTimeout(() => {
-      timer = null;
+    scanTimer = setTimeout(() => {
+      scanTimer = null;
       if (disposed) return;
       void (async () => {
         let latest = settings;
         try {
           latest = await loadSettings();
           if (latest.enabled) {
-            await executeSweep({ dryRun: false, trigger: "auto", refresh: true }).catch(
-              () => undefined,
-            );
+            await executeSweep({
+              dryRun: false,
+              trigger: "auto",
+              refresh: true,
+              respectGrace: true,
+            }).catch(() => undefined);
           }
         } catch {
           // Never allow timer callbacks to trigger unhandled rejections.
         } finally {
           if (!disposed) {
             scheduleNext(latest);
+            schedulePendingFlush(latest);
           }
         }
       })();
     }, delayMs);
-    timer.unref?.();
+    scanTimer.unref?.();
   }
 
   const initialSettings = await loadSettings();
   if (options.autoSchedule !== false) {
     scheduleNext(initialSettings, INITIAL_SWEEP_DELAY_MS);
-    // Warm up the catalog cache asynchronously right after activation without blocking activate().
+    schedulePendingFlush(initialSettings);
     void refreshCatalogInBackground(true);
   }
 
@@ -628,21 +800,28 @@ export async function activate(ctx, options = {}) {
     const settings = await loadSettings();
     if (settings.enabled && nextRunAt === null && options.autoSchedule !== false) {
       scheduleNext(settings);
-    } else if (!settings.enabled && nextRunAt !== null) {
+      schedulePendingFlush(settings);
+    } else if (!settings.enabled && (nextRunAt !== null || nextPendingDueAt !== null)) {
       scheduleNext(settings);
+      schedulePendingFlush(settings);
     }
 
     const forceRefresh = Boolean(params?.refresh);
     const online = await rpc.isOnline();
     catalogCache.hostConnected = online;
-    if (online && (forceRefresh || catalogCache.updatedAt === 0 || nowFn() - catalogCache.updatedAt >= CATALOG_TTL_MS)) {
+    if (
+      online &&
+      (forceRefresh || catalogCache.updatedAt === 0 || nowFn() - catalogCache.updatedAt >= CATALOG_TTL_MS)
+    ) {
       void refreshCatalogInBackground(forceRefresh);
     }
 
     const items = evaluateCachedThreads(settings);
     const expiring = items.filter((item) => item.eligible);
+    const pendingItems = expiring.filter((item) => item.pendingDueAt !== null);
     return {
       pid: process.pid,
+      nowMs: nowFn(),
       settings,
       protectedThreadIds: protectedStore.threadIds,
       protectedMeta: protectedStore.meta,
@@ -654,10 +833,12 @@ export async function activate(ctx, options = {}) {
       sweepProgress,
       lastRunAt,
       nextRunAt,
+      nextPendingDueAt,
       lastSummary,
       stats: {
         totalActive: items.length,
         expiredCount: expiring.length,
+        pendingCount: pendingItems.length,
         protectedActiveCount: items.filter((item) => item.isProtected).length,
         expiringPreview: expiring.slice(0, 12),
       },
@@ -670,7 +851,10 @@ export async function activate(ctx, options = {}) {
     const forceRefresh = Boolean(params?.refresh);
     const online = await rpc.isOnline();
     catalogCache.hostConnected = online;
-    if (online && (forceRefresh || catalogCache.updatedAt === 0 || nowFn() - catalogCache.updatedAt >= CATALOG_TTL_MS)) {
+    if (
+      online &&
+      (forceRefresh || catalogCache.updatedAt === 0 || nowFn() - catalogCache.updatedAt >= CATALOG_TTL_MS)
+    ) {
       void refreshCatalogInBackground(forceRefresh);
     }
     const items = evaluateCachedThreads(settings);
@@ -689,7 +873,7 @@ export async function activate(ctx, options = {}) {
   ctx.handle("updateSettings", async (params) => {
     const patch = params && typeof params === "object" && !Array.isArray(params) ? params : {};
     const settings = await saveSettings(patch);
-    return { settings, nextRunAt };
+    return { settings, nextRunAt, nextPendingDueAt };
   });
 
   ctx.handle("toggleProtect", async (params) => {
@@ -708,6 +892,11 @@ export async function activate(ctx, options = {}) {
             : meta[threadId]?.title ?? "",
         addedAt: meta[threadId]?.addedAt ?? nowFn(),
       };
+      if (pendingArchives[threadId]) {
+        delete pendingArchives[threadId];
+        await savePendingArchives();
+        schedulePendingFlush(await loadSettings());
+      }
     } else {
       set.delete(threadId);
       delete meta[threadId];
@@ -724,8 +913,10 @@ export async function activate(ctx, options = {}) {
   ctx.handle("runSweep", async (params) => {
     const dryRun = Boolean(params?.dryRun);
     const asyncMode = Boolean(params?.async);
+    const trigger = params?.trigger === "auto" ? "auto" : "manual";
+    const respectGrace =
+      typeof params?.respectGrace === "boolean" ? params.respectGrace : trigger === "auto";
     if (dryRun) {
-      // Fast dry-run directly from cache (or await quick refresh only if cache is empty and synchronous).
       const settings = await loadSettings();
       if (catalogCache.updatedAt === 0 && !asyncMode) {
         await refreshCatalogInBackground(true);
@@ -737,14 +928,17 @@ export async function activate(ctx, options = {}) {
       return {
         ranAt: nowFn(),
         dryRun: true,
-        trigger: "manual",
+        trigger,
         scannedCount: items.length,
         protectedCount: items.filter((item) => item.isProtected).length,
         eligibleCount: candidates.length,
+        queuedCount: 0,
+        pendingCount: Object.keys(pendingArchives).length,
         archivedCount: 0,
         failedCount: 0,
         error: null,
         candidates,
+        queued: [],
         archived: [],
         failed: [],
       };
@@ -753,12 +947,15 @@ export async function activate(ctx, options = {}) {
       if (sweeping) {
         return { started: false, busy: true, sweepProgress };
       }
-      void executeSweep({ dryRun: false, trigger: "manual", refresh: false }).catch(
-        () => undefined,
-      );
+      void executeSweep({
+        dryRun: false,
+        trigger,
+        refresh: false,
+        respectGrace,
+      }).catch(() => undefined);
       return { started: true, busy: false, sweepProgress };
     }
-    return executeSweep({ dryRun: false, trigger: "manual", refresh: true });
+    return executeSweep({ dryRun: false, trigger, refresh: true, respectGrace });
   });
 
   ctx.handle("unarchiveThread", async (params) => {
@@ -798,5 +995,6 @@ export async function activate(ctx, options = {}) {
   return () => {
     disposed = true;
     clearScheduledTimer();
+    clearPendingTimer();
   };
 }

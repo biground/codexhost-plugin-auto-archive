@@ -1,6 +1,7 @@
 import {
   broadcastProtectedChange,
   createMessages,
+  formatCountdown,
   formatDaysAgo,
   normalizeProtectedIds,
   normalizeSettings,
@@ -29,7 +30,8 @@ export async function mount(root, api) {
 
   let settings = normalizeSettings(await api.storage.get().catch(() => ({})));
   let protectedThreadIds = [];
-  let stats = { totalActive: 0, expiredCount: 0, protectedActiveCount: 0, expiringPreview: [] };
+  let nowMs = Date.now();
+  let stats = { totalActive: 0, expiredCount: 0, pendingCount: 0, protectedActiveCount: 0, expiringPreview: [] };
   let busy = false;
   let notice = "";
   let noticeTimer = null;
@@ -54,6 +56,7 @@ export async function mount(root, api) {
       if (result && typeof result === "object") {
         settings = normalizeSettings(result.settings);
         protectedThreadIds = normalizeProtectedIds(result.protectedThreadIds);
+        nowMs = result.nowMs ?? Date.now();
         stats = result.stats ?? stats;
       }
       render();
@@ -153,7 +156,11 @@ export async function mount(root, api) {
                           <div class="aag-widget-item">
                             <div class="aag-widget-item-text">
                               <div class="aag-widget-item-title">${escapeHtml(item.title)}</div>
-                              <div class="aag-widget-item-age">${escapeHtml(formatDaysAgo(item.daysInactive, locale))}</div>
+                              <div class="aag-widget-item-age">${escapeHtml(
+                                item.pendingDueAt !== null
+                                  ? formatCountdown(item.pendingDueAt, nowMs, locale)
+                                  : formatDaysAgo(item.daysInactive, locale),
+                              )}</div>
                             </div>
                             <button
                               type="button"

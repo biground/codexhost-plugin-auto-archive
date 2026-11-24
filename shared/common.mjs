@@ -1,8 +1,9 @@
 export const DEFAULT_SETTINGS = Object.freeze({
   enabled: true,
-  retentionDays: 30,
+  retentionDays: 3,
   dateField: "updatedAt",
-  checkIntervalMinutes: 30,
+  checkIntervalMinutes: 1440,
+  graceMinutes: 30,
   skipPinned: true,
   showWidget: true,
 });
@@ -23,8 +24,12 @@ export function normalizeSettings(raw) {
   const dateField = source.dateField === "createdAt" ? "createdAt" : "updatedAt";
   const rawInterval = Number(source.checkIntervalMinutes);
   const checkIntervalMinutes = Number.isFinite(rawInterval)
-    ? Math.max(5, Math.min(1440, Math.round(rawInterval)))
+    ? Math.max(5, Math.min(10080, Math.round(rawInterval)))
     : DEFAULT_SETTINGS.checkIntervalMinutes;
+  const rawGrace = Number(source.graceMinutes);
+  const graceMinutes = Number.isFinite(rawGrace)
+    ? Math.max(0, Math.min(10080, Math.round(rawGrace)))
+    : DEFAULT_SETTINGS.graceMinutes;
   const skipPinned =
     typeof source.skipPinned === "boolean" ? source.skipPinned : DEFAULT_SETTINGS.skipPinned;
   const showWidget =
@@ -34,6 +39,7 @@ export function normalizeSettings(raw) {
     retentionDays,
     dateField,
     checkIntervalMinutes,
+    graceMinutes,
     skipPinned,
     showWidget,
   };
@@ -134,12 +140,25 @@ export function formatDaysAgo(days, locale) {
   return isZhLocale(locale) ? `${whole} 天前` : `${whole}d ago`;
 }
 
+export function formatCountdown(dueAtMs, nowMs, locale) {
+  if (typeof dueAtMs !== "number" || !Number.isFinite(dueAtMs)) return "";
+  const remainMs = Math.max(0, dueAtMs - nowMs);
+  const zh = isZhLocale(locale);
+  if (remainMs <= 30_000) return zh ? "即将归档" : "Archiving soon";
+  const mins = Math.ceil(remainMs / 60_000);
+  if (mins < 60) return zh ? `${mins} 分钟后归档` : `Archives in ${mins}m`;
+  const hours = Math.floor(mins / 60);
+  const remMins = mins % 60;
+  if (zh) return remMins > 0 ? `${hours} 小时 ${remMins} 分钟后归档` : `${hours} 小时后归档`;
+  return remMins > 0 ? `Archives in ${hours}h ${remMins}m` : `Archives in ${hours}h`;
+}
+
 export function createMessages(locale) {
   const zh = isZhLocale(locale);
   if (zh) {
     return {
       title: "自动归档与常驻保护",
-      subtitle: "定时归档长期不活跃会话，支持在每个会话的「更多」菜单中一键设置常驻防归档。",
+      subtitle: "定时归档长期不活跃会话，支持扫描后延迟归档缓冲及在每个会话的「更多」菜单中一键常驻防归档。",
       hostOnline: "共享 Host 已连接",
       hostOffline: "等待共享 Host 连接",
       autoEnabled: "启用自动归档",
@@ -148,6 +167,8 @@ export function createMessages(locale) {
       dateUpdated: "最后活跃时间",
       dateCreated: "创建时间",
       scanInterval: "扫描间隔（分钟）",
+      graceMinutes: "扫描后延迟归档（分钟）",
+      graceZeroHint: "0 = 立即归档",
       skipPinned: "自动跳过置顶会话",
       showWidget: "显示主窗口悬浮挂件",
       saveSettings: "保存规则",
@@ -158,10 +179,12 @@ export function createMessages(locale) {
       refresh: "刷新",
       statProtected: "常驻防归档",
       statExpiring: "待归档（已超期）",
+      statPending: "倒计时队列中",
       statTotal: "活跃会话总数",
       statArchived: "累计自动归档",
       lastScan: "上次扫描",
       nextScan: "下次计划",
+      nextDue: "最近到期归档",
       tabSessions: "会话保护列表",
       tabHistory: "归档记录",
       filterAll: "全部",
@@ -180,7 +203,7 @@ export function createMessages(locale) {
       restore: "取消归档",
       restoreAndProtect: "恢复并防归档",
       clearHistory: "清空记录",
-      confirmArchive: (count) => `确认立即归档 ${count} 个已超期且未受保护的会话吗？`,
+      confirmArchive: (count) => `确认立即归档 ${count} 个已超期且未受保护的会话吗？（跳过延迟缓冲）`,
       noExpiredToArchive: "当前没有需要归档的超期会话。",
       sweepDone: (archived, failed) =>
         failed > 0
@@ -194,23 +217,25 @@ export function createMessages(locale) {
       restoredProtectedToast: "已恢复会话并设为常驻防归档",
       menuProtect: "防止自动归档",
       menuProtected: "已防止自动归档",
-      menuTip: "提示：可在任意会话的「更多（…）」菜单中快速切换常驻防归档。",
+      menuTip: "提示：可在任意会话的「更多（…）」菜单中快速切换常驻防归档；扫描命中超期会话后将按延迟分钟数倒计时归档。",
       widgetTitle: "自动归档",
       widgetPaused: "已暂停",
       widgetRunning: (days) => `超 ${days} 天`,
       widgetProtectedShort: (n) => `${n} 保护`,
       widgetExpiringShort: (n) => `${n} 待归档`,
+      widgetPendingShort: (n) => `${n} 倒计时`,
       widgetClose: "收起",
       widgetOpen: "展开面板",
       widgetNoExpiring: "所有会话均处于安全期或已受保护",
       daysUnit: "天",
+      minsUnit: "分",
       triggerAuto: "定时自动",
       triggerManual: "手动触发",
     };
   }
   return {
     title: "Auto Archive & Keep Guard",
-    subtitle: "Automatically archive stale sessions while protecting key threads from each session's More menu.",
+    subtitle: "Automatically archive stale sessions with a grace delay while protecting key threads from each session's More menu.",
     hostOnline: "Shared Host Connected",
     hostOffline: "Waiting for Shared Host",
     autoEnabled: "Enable Auto-Archive",
@@ -219,6 +244,8 @@ export function createMessages(locale) {
     dateUpdated: "Last Activity",
     dateCreated: "Creation Time",
     scanInterval: "Scan Interval (Min)",
+    graceMinutes: "Delay After Scan (Min)",
+    graceZeroHint: "0 = immediate",
     skipPinned: "Skip Pinned Sessions",
     showWidget: "Show Floating Widget",
     saveSettings: "Save Rules",
@@ -229,10 +256,12 @@ export function createMessages(locale) {
     refresh: "Refresh",
     statProtected: "Protected",
     statExpiring: "Ready to Archive",
+    statPending: "In Grace Queue",
     statTotal: "Active Sessions",
     statArchived: "Archived History",
     lastScan: "Last Scan",
     nextScan: "Next Scan",
+    nextDue: "Next Due Archive",
     tabSessions: "Session Guard List",
     tabHistory: "Archive History",
     filterAll: "All",
@@ -251,7 +280,7 @@ export function createMessages(locale) {
     restore: "Unarchive",
     restoreAndProtect: "Restore & Protect",
     clearHistory: "Clear History",
-    confirmArchive: (count) => `Archive ${count} expired unprotected session(s) now?`,
+    confirmArchive: (count) => `Archive ${count} expired unprotected session(s) immediately (skipping grace delay)?`,
     noExpiredToArchive: "No expired unprotected sessions to archive.",
     sweepDone: (archived, failed) =>
       failed > 0
@@ -265,16 +294,18 @@ export function createMessages(locale) {
     restoredProtectedToast: "Session restored and protected",
     menuProtect: "Keep from Auto-Archive",
     menuProtected: "Protected from Auto-Archive",
-    menuTip: "Tip: Toggle Keep from Auto-Archive directly inside any session's More (…) menu.",
+    menuTip: "Tip: Toggle Keep from Auto-Archive in any session's More (…) menu; scanned expired sessions wait for the configured grace delay before archiving.",
     widgetTitle: "Auto Archive",
     widgetPaused: "Paused",
     widgetRunning: (days) => `>${days}d`,
     widgetProtectedShort: (n) => `${n} kept`,
     widgetExpiringShort: (n) => `${n} due`,
+    widgetPendingShort: (n) => `${n} queued`,
     widgetClose: "Collapse",
     widgetOpen: "Expand",
     widgetNoExpiring: "All sessions are fresh or protected",
     daysUnit: "d",
+    minsUnit: "m",
     triggerAuto: "Scheduled",
     triggerManual: "Manual",
   };

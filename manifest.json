@@ -5,14 +5,14 @@
     "en": "Auto Archive & Keep Guard",
     "zh-CN": "自动归档与常驻保护"
   },
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": {
-    "en": "Automatically archive inactive sessions older than N days while letting you mark any session as permanently protected from its More menu.",
-    "zh-CN": "按设定天数自动归档长期不活跃的会话，并在每个会话的「更多」菜单中添加常驻「防止自动归档」保护开关。"
+    "en": "Automatically archive inactive sessions older than N days with a configurable grace delay, while letting you mark any session as permanently protected from its More menu.",
+    "zh-CN": "按设定天数自动归档长期不活跃的会话（支持扫描后延迟 X 分钟缓冲归档），并在每个会话的「更多」菜单中添加常驻「防止自动归档」保护开关。"
   },
   "details": {
-    "en": "## Features\n\n- **Scheduled Auto-Archive**: Runs inside the shared CodexHost backend to archive sessions inactive for more than a configurable number of days (default: **30 days**), even when Desktop or Web windows are closed.\n- **Per-Session Protection in More Menu**: Adds a persistent **Keep from Auto-Archive** toggle directly into every session's `...` **More** menu (and right-click menu) in both **Codex Desktop** and **CodexHost Web**, with a shield indicator on protected rows.\n- **Safety Guards**: Never archives currently running/waiting sessions, optionally skips pinned sessions, supports dry-run previews, and keeps an archive log with one-click restore.\n- **Cross-Platform Management Page & Floating Widget**: Manage retention days, review expiring sessions, toggle permanent protection in bulk, or restore recently archived threads from Desktop or Web.\n\n## How It Works\n\n1. Enable the plugin and configure the retention threshold in **Plugin Details**, the **Auto Archive** management page, or the floating widget.\n2. Open any session's `...` menu in the sidebar and toggle **Keep from Auto-Archive** to protect important threads permanently.\n3. The shared Host backend periodically checks active threads via local Host RPC and archives only eligible unprotected threads.",
-    "zh-CN": "## 核心功能\n\n- **定时自动归档**：依托共享 CodexHost 单实例后端运行，自动归档超过指定天数未活跃的会话（默认 **30 天**），即使关闭 Desktop 或 Web 窗口也会持续生效。\n- **会话「更多」菜单常驻防归档**：在 **Codex Desktop** 与 **CodexHost Web** 的每个会话「更多（`...`）」菜单（及右键菜单）中常驻注入 **防止自动归档** 开关，并在受保护的会话行显示盾牌标识，规避自动归档。\n- **多重安全保护**：自动跳过正在运行或等待回复的会话，支持跳过置顶会话、试运行（Dry Run）预览、以及归档日志内一键恢复并加护。\n- **跨端独立管理页 + 主窗口悬浮挂件**：在 Desktop 与 Web 统一管理保留天数、筛选即将超期会话、批量配置常驻保护或恢复已归档会话。\n\n## 使用方式\n\n1. 启用插件后，在「插件详情」、独立管理页或右下角挂件中设置自动归档开关与保留天数。\n2. 点击侧边栏任意会话的 `...` 更多按钮（或右键菜单），开启 **防止自动归档** 即可永久保护该会话。\n3. 共享 Host 后端会按设定周期扫描所有未归档会话，仅归档超过天数且未受保护的空闲会话。"
+    "en": "## Features\n\n- **Scheduled Auto-Archive with Grace Delay**: Runs inside the shared CodexHost backend to scan inactive sessions older than a configurable threshold (default: **3 days**, scanned every **1440 min / 24h**) and waits a configurable grace window (default: **30 minutes**) before archiving so you always have time to protect important threads.\n- **Per-Session Protection in More Menu**: Adds a persistent **Keep from Auto-Archive** toggle directly into every session's `...` **More** menu (and right-click menu) in both **Codex Desktop** and **CodexHost Web**, with a shield indicator on protected rows.\n- **Safety Guards**: Never archives currently running/waiting sessions, skips pinned sessions by default, supports dry-run previews, live grace-period countdowns, and an archive history log with one-click restore.\n- **Cross-Platform Management Page & Floating Widget**: Manage retention days, grace delay, review pending countdowns, toggle permanent protection in bulk, or restore recently archived threads from Desktop or Web.\n\n## How It Works\n\n1. Enable the plugin and review the default rules (3 days retention, 1440 min scan interval, 30 min grace delay) in **Plugin Details**, the **Auto Archive** management page, or the floating widget.\n2. Open any session's `...` menu in the sidebar and toggle **Keep from Auto-Archive** to protect important threads permanently (or cancel any pending grace countdown).\n3. When an automated scan detects eligible stale threads, they enter the grace countdown queue and are archived automatically once the grace window elapses unless protected or reactivated.",
+    "zh-CN": "## 核心功能\n\n- **定时自动归档 + 延迟缓冲期**：依托共享 CodexHost 单实例后端运行，按设定天数阈值定时扫描不活跃会话（默认 **3 天**、每 **1440 分钟 / 24 小时**扫描一次）；扫描到超期会话后默认延迟 **30 分钟**再正式归档，期间可随时一键保护取消归档。\n- **会话「更多」菜单常驻防归档**：在 **Codex Desktop** 与 **CodexHost Web** 的每个会话「更多（`...`）」菜单（及右键菜单）中常驻注入 **防止自动归档** 开关，并在受保护的会话行显示盾牌标识，永久规避自动归档。\n- **多重安全保护**：自动跳过正在运行或等待回复的会话，默认跳过置顶会话，支持试运行（Dry Run）预览、待归档倒计时展示，以及归档日志内一键恢复并加护。\n- **跨端独立管理页 + 主窗口悬浮挂件**：在 Desktop 与 Web 统一管理归档天数、延迟归档分钟数、筛选倒计时/超期会话、批量配置常驻保护或恢复已归档会话。\n\n## 使用方式\n\n1. 启用插件后，默认规则为 **3 天阈值 / 1440 分钟扫描间隔 / 扫描后延迟 30 分钟归档 / 跳过置顶**，可在「插件详情」、独立管理页或右下角挂件中随时调整。\n2. 点击侧边栏任意会话的 `...` 更多按钮（或右键菜单），开启 **防止自动归档** 即可永久保护该会话（若已在倒计时队列中会自动撤回）。\n3. 自动扫描命中超期空闲会话后，会先进入宽限倒计时队列，待设定分钟数到期并复核无新增活跃/未受保护后才正式归档。"
   },
   "author": "biground",
   "repository": "https://github.com/biground/codexhost-plugin-auto-archive",
@@ -41,13 +41,13 @@
         "zh-CN": "自动归档天数阈值"
       },
       "description": {
-        "en": "Sessions inactive for at least this many days will be archived.",
-        "zh-CN": "超过该天数未活跃的会话将被自动归档（最小 1 天）。"
+        "en": "Sessions inactive for at least this many days will be queued for auto-archive.",
+        "zh-CN": "超过该天数未活跃的会话将被纳入自动归档（默认 3 天，最小 1 天）。"
       },
       "min": 1,
       "max": 3650,
       "step": 1,
-      "default": 30
+      "default": 3
     },
     {
       "key": "dateField",
@@ -87,10 +87,26 @@
       },
       "description": {
         "en": "How often the shared Host backend scans for expired sessions.",
-        "zh-CN": "共享 Host 后端每隔多少分钟自动扫描一次超期会话。"
+        "zh-CN": "共享 Host 后端每隔多少分钟自动扫描一次超期会话（默认 1440 分钟即 24 小时）。"
       },
       "min": 5,
-      "max": 1440,
+      "max": 10080,
+      "step": 5,
+      "default": 1440
+    },
+    {
+      "key": "graceMinutes",
+      "type": "number",
+      "label": {
+        "en": "Archive Delay After Scan (Minutes)",
+        "zh-CN": "扫描到会话后延迟归档（分钟）"
+      },
+      "description": {
+        "en": "Wait this many minutes after an auto-scan detects an expired session before archiving it (0 = archive immediately).",
+        "zh-CN": "自动扫描命中超期会话后等待多少分钟再正式归档，期间可随时设为常驻防归档（默认 30 分钟，填 0 表示立即归档）。"
+      },
+      "min": 0,
+      "max": 10080,
       "step": 5,
       "default": 30
     },

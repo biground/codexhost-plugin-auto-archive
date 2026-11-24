@@ -194,12 +194,14 @@ test("backend archives only unprotected expired threads via local Host HTTP RPC 
 
   let storedSettings = {
     enabled: true,
-    retentionDays: 30,
+    retentionDays: 3,
     dateField: "updatedAt",
-    checkIntervalMinutes: 30,
+    checkIntervalMinutes: 1440,
+    graceMinutes: 30,
     skipPinned: true,
     showWidget: true,
   };
+  let currentNow = nowMs;
   const handlers = new Map();
   const dispose = await activate(
     {
@@ -213,11 +215,17 @@ test("backend archives only unprotected expired threads via local Host HTTP RPC 
       },
       handle: (method, fn) => handlers.set(method, fn),
     },
-    { autoSchedule: false, now: () => nowMs },
+    { autoSchedule: false, now: () => currentNow },
   );
 
   try {
-    // 1. Mark thr-old-guarded as protected (simulating click in More menu)
+    // 1. Auto scan with 30m grace delay queues expired threads without archiving immediately
+    const firstAuto = await handlers.get("runSweep")({ dryRun: false, trigger: "auto" });
+    assert.equal(firstAuto.archivedCount, 0);
+    assert.equal(firstAuto.queuedCount, 2);
+    assert.deepEqual(archivedCalls, []);
+
+    // 2. User protects thr-old-guarded during the 30-minute grace window
     const toggleRes = await handlers.get("toggleProtect")({
       threadId: "thr-old-guarded",
       protected: true,
@@ -226,24 +234,31 @@ test("backend archives only unprotected expired threads via local Host HTTP RPC 
     assert.equal(toggleRes.protected, true);
     assert.deepEqual(toggleRes.protectedThreadIds, ["thr-old-guarded"]);
 
-    // 2. Dry run sees only thr-old-1
+    // 3. Before 30m elapses (at +15m), still nothing archived
+    currentNow = nowMs + 15 * 60_000;
+    const midAuto = await handlers.get("runSweep")({ dryRun: false, trigger: "auto" });
+    assert.equal(midAuto.archivedCount, 0);
+    assert.deepEqual(archivedCalls, []);
+
+    // 4. Dry run sees only thr-old-1
     const dryRes = await handlers.get("runSweep")({ dryRun: true });
     assert.equal(dryRes.eligibleCount, 1);
     assert.equal(dryRes.candidates[0].id, "thr-old-1");
     assert.deepEqual(archivedCalls, []);
 
-    // 3. Real sweep archives only thr-old-1
-    const sweepRes = await handlers.get("runSweep")({ dryRun: false });
-    assert.equal(sweepRes.archivedCount, 1);
+    // 5. After 31 minutes, auto sweep archives only unprotected thr-old-1
+    currentNow = nowMs + 31 * 60_000;
+    const dueAuto = await handlers.get("runSweep")({ dryRun: false, trigger: "auto" });
+    assert.equal(dueAuto.archivedCount, 1);
     assert.deepEqual(archivedCalls, ["thr-old-1"]);
 
-    // 4. History recorded thr-old-1
+    // 6. History recorded thr-old-1
     const state = await handlers.get("getState")();
     assert.equal(state.hostConnected, true);
     assert.equal(state.history.length, 1);
     assert.equal(state.history[0].threadId, "thr-old-1");
 
-    // 5. Restore and protect thr-old-1
+    // 7. Restore and protect thr-old-1
     const restoreRes = await handlers.get("unarchiveThread")({
       threadId: "thr-old-1",
       title: "Old Session 1",
@@ -253,8 +268,8 @@ test("backend archives only unprotected expired threads via local Host HTTP RPC 
     assert.deepEqual(unarchivedCalls, ["thr-old-1"]);
     assert.ok(restoreRes.protectedThreadIds.includes("thr-old-1"));
 
-    // 6. Second sweep archives nothing now
-    const sweepAgain = await handlers.get("runSweep")({ dryRun: false });
+    // 8. Next sweep archives nothing now
+    const sweepAgain = await handlers.get("runSweep")({ dryRun: false, trigger: "manual" });
     assert.equal(sweepAgain.archivedCount, 0);
   } finally {
     await dispose();

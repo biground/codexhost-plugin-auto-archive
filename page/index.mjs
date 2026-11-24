@@ -1,6 +1,7 @@
 import {
   broadcastProtectedChange,
   createMessages,
+  formatCountdown,
   formatDaysAgo,
   formatTimestamp,
   normalizeProtectedIds,
@@ -9,7 +10,8 @@ import {
   subscribeProtectedChange,
 } from "../shared/common.mjs";
 
-const RETENTION_PRESETS = [7, 14, 30, 60, 90];
+const RETENTION_PRESETS = [3, 7, 14, 30, 60, 90];
+const GRACE_PRESETS = [0, 15, 30, 60, 120];
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -29,7 +31,9 @@ export async function mount(root, api) {
     hostError: null,
     lastRunAt: null,
     nextRunAt: null,
-    stats: { totalActive: 0, expiredCount: 0, protectedActiveCount: 0 },
+    nextPendingDueAt: null,
+    nowMs: Date.now(),
+    stats: { totalActive: 0, expiredCount: 0, pendingCount: 0, protectedActiveCount: 0 },
     threads: [],
     history: [],
     loading: true,
@@ -97,6 +101,8 @@ export async function mount(root, api) {
         state.sweepProgress = backendState.sweepProgress ?? null;
         state.lastRunAt = backendState.lastRunAt ?? null;
         state.nextRunAt = backendState.nextRunAt ?? null;
+        state.nextPendingDueAt = backendState.nextPendingDueAt ?? null;
+        state.nowMs = backendState.nowMs ?? Date.now();
         state.stats = backendState.stats ?? state.stats;
         state.history = Array.isArray(backendState.history) ? backendState.history : [];
         if (wasSweeping && !state.sweeping && backendState.lastSummary) {
@@ -112,10 +118,12 @@ export async function mount(root, api) {
       }
       if (threadList && Array.isArray(threadList.threads)) {
         state.threads = threadList.threads;
+        state.nowMs = threadList.nowMs ?? Date.now();
         state.refreshing = state.refreshing || Boolean(threadList.refreshing);
         state.stats = {
           totalActive: threadList.threads.length,
           expiredCount: threadList.threads.filter((item) => item.eligible).length,
+          pendingCount: threadList.threads.filter((item) => item.pendingDueAt !== null).length,
           protectedActiveCount: threadList.threads.filter((item) => item.isProtected).length,
         };
       }
@@ -343,7 +351,20 @@ export async function mount(root, api) {
 
             <div class="aag-field">
               <label for="aag-interval">${escapeHtml(msg.scanInterval)}</label>
-              <input id="aag-interval" type="number" min="5" max="1440" step="5" data-field="checkIntervalMinutes" value="${s.checkIntervalMinutes}" />
+              <input id="aag-interval" type="number" min="5" max="10080" step="5" data-field="checkIntervalMinutes" value="${s.checkIntervalMinutes}" />
+            </div>
+
+            <div class="aag-field">
+              <label for="aag-grace">${escapeHtml(msg.graceMinutes)} <span class="aag-label-hint">(${escapeHtml(msg.graceZeroHint)})</span></label>
+              <div class="aag-days-row">
+                <input id="aag-grace" type="number" min="0" max="10080" step="5" data-field="graceMinutes" value="${s.graceMinutes}" />
+                <div class="aag-presets">
+                  ${GRACE_PRESETS.map(
+                    (m) =>
+                      `<button type="button" class="aag-chip ${s.graceMinutes === m ? "is-active" : ""}" data-preset-grace="${m}">${m}${escapeHtml(msg.minsUnit)}</button>`,
+                  ).join("")}
+                </div>
+              </div>
             </div>
           </div>
 
@@ -352,6 +373,11 @@ export async function mount(root, api) {
               <span>${escapeHtml(msg.lastScan)}: <strong>${escapeHtml(formatTimestamp(state.lastRunAt, locale))}</strong></span>
               <span>·</span>
               <span>${escapeHtml(msg.nextScan)}: <strong>${escapeHtml(s.enabled ? formatTimestamp(state.nextRunAt, locale) : msg.widgetPaused)}</strong></span>
+              ${
+                state.nextPendingDueAt
+                  ? `<span>·</span><span>${escapeHtml(msg.nextDue)}: <strong>${escapeHtml(formatCountdown(state.nextPendingDueAt, state.nowMs, locale))}</strong></span>`
+                  : ""
+              }
             </div>
             <div class="aag-btn-group">
               <button type="button" class="aag-btn" data-action="refresh" ${state.loading ? "disabled" : ""}>${escapeHtml(msg.refresh)}</button>
@@ -430,7 +456,11 @@ export async function mount(root, api) {
           if (item.isPinned) {
             tags.push(`<span class="aag-tag">${escapeHtml(msg.badgePinned)}</span>`);
           }
-          if (item.eligible) {
+          if (item.pendingDueAt !== null) {
+            tags.push(
+              `<span class="aag-tag is-expired">${escapeHtml(formatCountdown(item.pendingDueAt, state.nowMs, locale))}</span>`,
+            );
+          } else if (item.eligible) {
             tags.push(`<span class="aag-tag is-expired">${escapeHtml(msg.badgeExpired)}</span>`);
           }
           return `
@@ -511,6 +541,9 @@ export async function mount(root, api) {
       root.querySelector('[data-field="checkIntervalMinutes"]')?.value ??
         state.settings.checkIntervalMinutes,
     );
+    const graceMinutes = Number(
+      root.querySelector('[data-field="graceMinutes"]')?.value ?? state.settings.graceMinutes,
+    );
     return {
       enabled,
       skipPinned,
@@ -518,6 +551,7 @@ export async function mount(root, api) {
       retentionDays,
       dateField,
       checkIntervalMinutes,
+      graceMinutes,
     };
   }
 
@@ -528,6 +562,15 @@ export async function mount(root, api) {
         const input = root.querySelector('[data-field="retentionDays"]');
         if (input) input.value = String(days);
         void saveRules({ ...readFormValues(), retentionDays: days });
+      });
+    });
+
+    root.querySelectorAll("[data-preset-grace]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const mins = Number(btn.getAttribute("data-preset-grace"));
+        const input = root.querySelector('[data-field="graceMinutes"]');
+        if (input) input.value = String(mins);
+        void saveRules({ ...readFormValues(), graceMinutes: mins });
       });
     });
 
