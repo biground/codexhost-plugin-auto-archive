@@ -1,0 +1,113 @@
+.cx-aag-web-menu-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--dsw-alias-border-l2, rgba(128, 128, 128, 0.22));
+}
+
+.cx-aag-web-menuitem {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 34px;
+  padding: 6px 8px;
+  border: none;
+  border-radius: var(--dsw-radius-md, 8px);
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--dsw-alias-label-primary, inherit);
+  text-align: left;
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+
+.cx-aag-web-menuitem:hover {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(128, 128, 128, 0.12));
+}
+
+.cx-aag-web-menuitem.is-protected {
+  color: var(--dsw-alias-brand-primary, #10a37f);
+}
+
+.cx-aag-web-menuitem.is-protected .cx-aag-web-icon {
+  color: var(--dsw-alias-brand-primary, #10a37f);
+}
+
+.cx-aag-web-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+
+.cx-aag-web-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cx-aag-web-pill {
+  flex: none;
+  margin-inline-start: auto;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  line-height: 16px;
+  background: rgba(128, 128, 128, 0.14);
+  color: var(--dsw-alias-label-secondary, #888);
+}
+
+.cx-aag-web-menuitem.is-protected .cx-aag-web-pill {
+  background: rgba(16, 163, 127, 0.16);
+  color: var(--dsw-alias-brand-primary, #10a37f);
+}
+
+.cx-aag-row-badge-wrap {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  margin-left: 4px;
+  pointer-events: none;
+}
+
+.cx-aag-row-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  color: var(--dsw-alias-brand-primary, #10a37f);
+  opacity: 0.9;
+}
+
+[data-cx-ext-auto-archive-guard-protected] .cx-aag-row-badge {
+  opacity: 1;
+}
+
+.cx-aag-toast-host {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  z-index: 1200;
+  pointer-events: none;
+}
+
+.cx-aag-toast {
+  padding: 8px 14px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #fff;
+  background: rgba(20, 22, 26, 0.9);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(8px);
+}

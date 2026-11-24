@@ -1,0 +1,152 @@
+{
+  "manifestVersion": 2,
+  "id": "auto-archive-guard",
+  "name": {
+    "en": "Auto Archive & Keep Guard",
+    "zh-CN": "自动归档与常驻保护"
+  },
+  "version": "1.0.0",
+  "description": {
+    "en": "Automatically archive inactive sessions older than N days while letting you mark any session as permanently protected from its More menu.",
+    "zh-CN": "按设定天数自动归档长期不活跃的会话，并在每个会话的「更多」菜单中添加常驻「防止自动归档」保护开关。"
+  },
+  "details": {
+    "en": "## Features\n\n- **Scheduled Auto-Archive**: Runs inside the shared CodexHost backend to archive sessions inactive for more than a configurable number of days (default: **30 days**), even when Desktop or Web windows are closed.\n- **Per-Session Protection in More Menu**: Adds a persistent **Keep from Auto-Archive** toggle directly into every session's `...` **More** menu (and right-click menu) in both **Codex Desktop** and **CodexHost Web**, with a shield indicator on protected rows.\n- **Safety Guards**: Never archives currently running/waiting sessions, optionally skips pinned sessions, supports dry-run previews, and keeps an archive log with one-click restore.\n- **Cross-Platform Management Page & Floating Widget**: Manage retention days, review expiring sessions, toggle permanent protection in bulk, or restore recently archived threads from Desktop or Web.\n\n## How It Works\n\n1. Enable the plugin and configure the retention threshold in **Plugin Details**, the **Auto Archive** management page, or the floating widget.\n2. Open any session's `...` menu in the sidebar and toggle **Keep from Auto-Archive** to protect important threads permanently.\n3. The shared Host backend periodically checks active threads via local Host RPC and archives only eligible unprotected threads.",
+    "zh-CN": "## 核心功能\n\n- **定时自动归档**：依托共享 CodexHost 单实例后端运行，自动归档超过指定天数未活跃的会话（默认 **30 天**），即使关闭 Desktop 或 Web 窗口也会持续生效。\n- **会话「更多」菜单常驻防归档**：在 **Codex Desktop** 与 **CodexHost Web** 的每个会话「更多（`...`）」菜单（及右键菜单）中常驻注入 **防止自动归档** 开关，并在受保护的会话行显示盾牌标识，规避自动归档。\n- **多重安全保护**：自动跳过正在运行或等待回复的会话，支持跳过置顶会话、试运行（Dry Run）预览、以及归档日志内一键恢复并加护。\n- **跨端独立管理页 + 主窗口悬浮挂件**：在 Desktop 与 Web 统一管理保留天数、筛选即将超期会话、批量配置常驻保护或恢复已归档会话。\n\n## 使用方式\n\n1. 启用插件后，在「插件详情」、独立管理页或右下角挂件中设置自动归档开关与保留天数。\n2. 点击侧边栏任意会话的 `...` 更多按钮（或右键菜单），开启 **防止自动归档** 即可永久保护该会话。\n3. 共享 Host 后端会按设定周期扫描所有未归档会话，仅归档超过天数且未受保护的空闲会话。"
+  },
+  "author": "biground",
+  "repository": "https://github.com/biground/codexhost-plugin-auto-archive",
+  "categories": ["workflow", "tools"],
+  "icon": "assets/icon.png",
+  "screenshots": ["assets/preview-page.png"],
+  "settingsSchema": [
+    {
+      "key": "enabled",
+      "type": "boolean",
+      "label": {
+        "en": "Enable Auto-Archive",
+        "zh-CN": "启用自动归档"
+      },
+      "description": {
+        "en": "Automatically archive inactive sessions that exceed the retention threshold.",
+        "zh-CN": "开启后，共享 Host 后端将定时归档超过设定天数的未保护空闲会话。"
+      },
+      "default": true
+    },
+    {
+      "key": "retentionDays",
+      "type": "number",
+      "label": {
+        "en": "Archive After (Days)",
+        "zh-CN": "自动归档天数阈值"
+      },
+      "description": {
+        "en": "Sessions inactive for at least this many days will be archived.",
+        "zh-CN": "超过该天数未活跃的会话将被自动归档（最小 1 天）。"
+      },
+      "min": 1,
+      "max": 3650,
+      "step": 1,
+      "default": 30
+    },
+    {
+      "key": "dateField",
+      "type": "select",
+      "label": {
+        "en": "Age Reference",
+        "zh-CN": "天数计算基准"
+      },
+      "description": {
+        "en": "Choose whether expiration is measured from last activity or creation time.",
+        "zh-CN": "选择按最后活跃时间还是按会话创建时间计算超期天数。"
+      },
+      "options": [
+        {
+          "value": "updatedAt",
+          "label": {
+            "en": "Last Activity Time",
+            "zh-CN": "最后活跃时间（推荐）"
+          }
+        },
+        {
+          "value": "createdAt",
+          "label": {
+            "en": "Creation Time",
+            "zh-CN": "会话创建时间"
+          }
+        }
+      ],
+      "default": "updatedAt"
+    },
+    {
+      "key": "checkIntervalMinutes",
+      "type": "number",
+      "label": {
+        "en": "Scan Interval (Minutes)",
+        "zh-CN": "定时扫描间隔（分钟）"
+      },
+      "description": {
+        "en": "How often the shared Host backend scans for expired sessions.",
+        "zh-CN": "共享 Host 后端每隔多少分钟自动扫描一次超期会话。"
+      },
+      "min": 5,
+      "max": 1440,
+      "step": 5,
+      "default": 30
+    },
+    {
+      "key": "skipPinned",
+      "type": "boolean",
+      "label": {
+        "en": "Skip Pinned Sessions",
+        "zh-CN": "自动跳过置顶会话"
+      },
+      "description": {
+        "en": "Keep pinned sessions from being auto-archived even without explicit protection.",
+        "zh-CN": "即使未单独开启「防止自动归档」，也自动跳过已置顶的会话。"
+      },
+      "default": true
+    },
+    {
+      "key": "showWidget",
+      "type": "boolean",
+      "label": {
+        "en": "Show Floating Widget",
+        "zh-CN": "显示主窗口悬浮挂件"
+      },
+      "description": {
+        "en": "Display a compact auto-archive status widget in Desktop and Web main windows.",
+        "zh-CN": "在 Desktop 与 Web 主页面右下角显示轻量状态挂件。"
+      },
+      "default": true
+    }
+  ],
+  "page": {
+    "apiVersion": 1,
+    "entry": "page/index.mjs",
+    "style": "page/style.css",
+    "title": {
+      "en": "Auto Archive",
+      "zh-CN": "自动归档"
+    }
+  },
+  "widget": {
+    "apiVersion": 1,
+    "entry": "widget/index.mjs",
+    "style": "widget/style.css"
+  },
+  "desktop": {
+    "apiVersion": 1,
+    "script": "desktop/index.js",
+    "style": "desktop/style.css"
+  },
+  "web": {
+    "apiVersion": 1,
+    "entry": "web/index.mjs",
+    "style": "web/style.css"
+  },
+  "backend": {
+    "apiVersion": 1,
+    "entry": "backend/index.mjs"
+  }
+}

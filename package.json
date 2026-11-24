@@ -1,0 +1,17 @@
+{
+  "name": "codexhost-auto-archive-guard",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "CodexHost unified extension (manifestVersion 2): auto-archive inactive sessions after N days and add a persistent Keep from Auto-Archive option in every session's More menu.",
+  "scripts": {
+    "assets": "node scripts/generate-assets.mjs",
+    "build": "node scripts/generate-assets.mjs && node scripts/build-zip.mjs",
+    "test": "node --test tests/plugin.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/biground/codexhost-plugin-auto-archive.git"
+  },
+  "license": "MIT"
+}
