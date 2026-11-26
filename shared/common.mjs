@@ -5,10 +5,13 @@ export const DEFAULT_SETTINGS = Object.freeze({
   checkIntervalMinutes: 1440,
   graceMinutes: 30,
   skipPinned: true,
-  showWidget: true,
+  showWidget: false,
 });
 
 export const SYNC_CHANNEL_NAME = "codexhost-auto-archive-guard-sync";
+export const NAV_INTENT_STORAGE_KEY = "cx.auto-archive-guard.nav-intent";
+export const NAV_EVENT_NAME = "cx-aag-navigate";
+export const SETTINGS_EVENT_NAME = "cx-aag-settings-changed";
 
 export function isZhLocale(locale) {
   return typeof locale === "string" && locale.toLowerCase().startsWith("zh");
@@ -110,6 +113,168 @@ export function subscribeProtectedChange(listener, signal) {
   return cleanup;
 }
 
+export function broadcastSettingsChange(settings) {
+  const normalized = normalizeSettings(settings);
+  try {
+    window.dispatchEvent(
+      new CustomEvent(SETTINGS_EVENT_NAME, { detail: { settings: normalized } }),
+    );
+  } catch {
+    // Ignore outside browser environments.
+  }
+  try {
+    if (typeof BroadcastChannel === "function") {
+      const ch = new BroadcastChannel(SYNC_CHANNEL_NAME);
+      ch.postMessage({ type: "settings", settings: normalized });
+      ch.close();
+    }
+  } catch {
+    // Ignore when BroadcastChannel is unavailable.
+  }
+}
+
+export function subscribeSettingsChange(listener, signal) {
+  const onCustom = (event) => {
+    const next = event?.detail?.settings;
+    if (next && typeof next === "object") listener(normalizeSettings(next));
+  };
+  try {
+    window.addEventListener(SETTINGS_EVENT_NAME, onCustom, { signal });
+  } catch {
+    // Ignore outside browser environments.
+  }
+  let ch = null;
+  try {
+    if (typeof BroadcastChannel === "function") {
+      ch = new BroadcastChannel(SYNC_CHANNEL_NAME);
+      ch.onmessage = (event) => {
+        if (event?.data?.type === "settings" && event.data.settings) {
+          listener(normalizeSettings(event.data.settings));
+        }
+      };
+    }
+  } catch {
+    ch = null;
+  }
+  const cleanup = () => {
+    try {
+      window.removeEventListener(SETTINGS_EVENT_NAME, onCustom);
+    } catch {
+      // Ignore.
+    }
+    ch?.close();
+    ch = null;
+  };
+  signal?.addEventListener?.("abort", cleanup, { once: true });
+  return cleanup;
+}
+
+function normalizeNavigationView(view) {
+  return view === "expiring" || view === "home" ? view : null;
+}
+
+export function publishNavigationIntent(view, options = {}) {
+  const normalized = normalizeNavigationView(view);
+  if (!normalized) return null;
+  const win = options.win ?? (typeof window !== "undefined" ? window : null);
+  const storage = options.storage ?? win?.sessionStorage ?? null;
+  const at = typeof options.now === "number" ? options.now : Date.now();
+  const payload = { view: normalized, at };
+  try {
+    storage?.setItem(NAV_INTENT_STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    // Ignore restricted storage contexts.
+  }
+  try {
+    if (win && typeof win.dispatchEvent === "function") {
+      const EventCtor = win.CustomEvent ?? globalThis.CustomEvent;
+      if (typeof EventCtor === "function") {
+        win.dispatchEvent(new EventCtor(NAV_EVENT_NAME, { detail: payload }));
+      }
+    }
+  } catch {
+    // Ignore outside browser environments.
+  }
+  try {
+    const ChannelCtor = options.BroadcastChannel ?? globalThis.BroadcastChannel;
+    if (typeof ChannelCtor === "function") {
+      const ch = new ChannelCtor(SYNC_CHANNEL_NAME);
+      ch.postMessage({ type: "navigate", ...payload });
+      ch.close();
+    }
+  } catch {
+    // Ignore when BroadcastChannel is unavailable.
+  }
+  return payload;
+}
+
+export function consumeNavigationIntent(options = {}) {
+  const win = options.win ?? (typeof window !== "undefined" ? window : null);
+  const storage = options.storage ?? win?.sessionStorage ?? null;
+  const maxAgeMs = typeof options.maxAgeMs === "number" ? options.maxAgeMs : 15_000;
+  const now = typeof options.now === "number" ? options.now : Date.now();
+  try {
+    const raw = storage?.getItem(NAV_INTENT_STORAGE_KEY);
+    if (!raw) return null;
+    storage?.removeItem(NAV_INTENT_STORAGE_KEY);
+    const parsed = JSON.parse(raw);
+    const view = normalizeNavigationView(parsed?.view);
+    const at = Number(parsed?.at);
+    if (!view || !Number.isFinite(at) || now - at > maxAgeMs) return null;
+    return view;
+  } catch {
+    return null;
+  }
+}
+
+export function subscribeNavigationIntent(listener, signal, options = {}) {
+  const win = options.win ?? (typeof window !== "undefined" ? window : null);
+  const storage = options.storage ?? win?.sessionStorage ?? null;
+  const dispatch = (rawView) => {
+    const view = normalizeNavigationView(rawView);
+    if (!view) return;
+    try {
+      storage?.removeItem(NAV_INTENT_STORAGE_KEY);
+    } catch {
+      // Ignore.
+    }
+    listener(view);
+  };
+  const onCustom = (event) => {
+    dispatch(event?.detail?.view);
+  };
+  try {
+    win?.addEventListener?.(NAV_EVENT_NAME, onCustom, { signal });
+  } catch {
+    // Ignore outside browser environments.
+  }
+  let ch = null;
+  try {
+    const ChannelCtor = options.BroadcastChannel ?? globalThis.BroadcastChannel;
+    if (typeof ChannelCtor === "function") {
+      ch = new ChannelCtor(SYNC_CHANNEL_NAME);
+      ch.onmessage = (event) => {
+        if (event?.data?.type === "navigate") {
+          dispatch(event.data.view);
+        }
+      };
+    }
+  } catch {
+    ch = null;
+  }
+  const cleanup = () => {
+    try {
+      win?.removeEventListener?.(NAV_EVENT_NAME, onCustom);
+    } catch {
+      // Ignore.
+    }
+    ch?.close();
+    ch = null;
+  };
+  signal?.addEventListener?.("abort", cleanup, { once: true });
+  return cleanup;
+}
+
 export function formatTimestamp(ms, locale) {
   if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) {
     return isZhLocale(locale) ? "暂无" : "Never";
@@ -170,7 +335,7 @@ export function createMessages(locale) {
       graceMinutes: "扫描后延迟归档（分钟）",
       graceZeroHint: "0 = 立即归档",
       skipPinned: "自动跳过置顶会话",
-      showWidget: "显示主窗口悬浮挂件",
+      showWidget: "显示右下角悬浮挂件",
       saveSettings: "保存规则",
       saving: "保存中…",
       saved: "规则已保存",
@@ -233,7 +398,9 @@ export function createMessages(locale) {
       widgetExpiringShort: (n) => `${n} 待归档`,
       widgetPendingShort: (n) => `${n} 倒计时`,
       widgetClose: "收起",
-      widgetOpen: "展开面板",
+      widgetOpen: "打开自动归档主页",
+      widgetOpenHome: "点击打开自动归档主页",
+      widgetOpenPending: (n) => `点击查看 ${n} 个待归档会话`,
       widgetNoExpiring: "所有会话均处于安全期或已受保护",
       daysUnit: "天",
       minsUnit: "分",
@@ -255,7 +422,7 @@ export function createMessages(locale) {
     graceMinutes: "Delay After Scan (Min)",
     graceZeroHint: "0 = immediate",
     skipPinned: "Skip Pinned Sessions",
-    showWidget: "Show Floating Widget",
+    showWidget: "Show Bottom-Right Widget",
     saveSettings: "Save Rules",
     saving: "Saving…",
     saved: "Rules saved",
@@ -318,7 +485,9 @@ export function createMessages(locale) {
     widgetExpiringShort: (n) => `${n} due`,
     widgetPendingShort: (n) => `${n} queued`,
     widgetClose: "Collapse",
-    widgetOpen: "Expand",
+    widgetOpen: "Open Auto Archive home",
+    widgetOpenHome: "Click to open Auto Archive home",
+    widgetOpenPending: (n) => `Click to view ${n} session(s) ready to archive`,
     widgetNoExpiring: "All sessions are fresh or protected",
     daysUnit: "d",
     minsUnit: "m",

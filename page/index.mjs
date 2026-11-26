@@ -1,5 +1,7 @@
 import {
   broadcastProtectedChange,
+  broadcastSettingsChange,
+  consumeNavigationIntent,
   createMessages,
   formatCountdown,
   formatDaysAgo,
@@ -7,6 +9,7 @@ import {
   normalizeProtectedIds,
   normalizeSettings,
   shieldSvg,
+  subscribeNavigationIntent,
   subscribeProtectedChange,
 } from "../shared/common.mjs";
 
@@ -24,6 +27,9 @@ function escapeHtml(value) {
 
 export async function mount(root, api) {
   let locale = api.locale || "en";
+  const initialIntent = consumeNavigationIntent({ win: root.ownerDocument?.defaultView });
+  let pendingScrollTarget =
+    initialIntent === "expiring" ? "list" : initialIntent === "home" ? "top" : null;
   let state = {
     settings: normalizeSettings(await api.storage.get().catch(() => ({}))),
     protectedThreadIds: [],
@@ -45,7 +51,7 @@ export async function mount(root, api) {
     sweeping: false,
     sweepProgress: null,
     activeTab: "sessions",
-    filter: "all",
+    filter: initialIntent === "expiring" ? "expiring" : "all",
     archivedFilter: "all",
     search: "",
     archivedSearch: "",
@@ -54,6 +60,33 @@ export async function mount(root, api) {
     bannerTone: "info",
     confirmPendingCount: null,
   };
+
+  function scrollToTarget(target) {
+    if (!target || api.signal.aborted) return;
+    const node =
+      target === "list"
+        ? root.querySelector(".aag-list-card")
+        : root.querySelector(".aag-page");
+    node?.scrollIntoView?.({ behavior: "smooth", block: "start" });
+  }
+
+  function applyNavigationIntent(view, shouldRefresh = true) {
+    if (view === "expiring") {
+      state.activeTab = "sessions";
+      state.filter = "expiring";
+      state.search = "";
+      render();
+      scrollToTarget("list");
+      if (shouldRefresh) void refreshAll(true);
+    } else if (view === "home") {
+      state.activeTab = "sessions";
+      state.filter = "all";
+      state.search = "";
+      render();
+      scrollToTarget("top");
+      if (shouldRefresh) void refreshAll(true);
+    }
+  }
 
   let bannerTimer = null;
   let refreshTimer = null;
@@ -178,6 +211,7 @@ export async function mount(root, api) {
       } else {
         state.settings = next;
       }
+      broadcastSettingsChange(state.settings);
       const msg = createMessages(locale);
       showBanner(msg.saved, "success");
       await refreshAll(true);
@@ -372,7 +406,7 @@ export async function mount(root, api) {
             <div class="aag-stat-label">${escapeHtml(msg.statProtected)}</div>
             <div class="aag-stat-value">${state.protectedThreadIds.length}</div>
           </div>
-          <div class="aag-stat-card ${state.stats.expiredCount > 0 ? "is-warn" : ""}">
+          <div class="aag-stat-card is-clickable ${state.stats.expiredCount > 0 ? "is-warn" : ""}" data-jump-expiring role="button" tabindex="0">
             <div class="aag-stat-label">${escapeHtml(msg.statExpiring)}</div>
             <div class="aag-stat-value">${state.stats.expiredCount}</div>
           </div>
@@ -822,6 +856,18 @@ export async function mount(root, api) {
         if (id) void handleUnarchive(id, title, true);
       });
     });
+
+    const expiringCard = root.querySelector("[data-jump-expiring]");
+    if (expiringCard) {
+      const jump = () => applyNavigationIntent("expiring", false);
+      expiringCard.addEventListener("click", jump);
+      expiringCard.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          jump();
+        }
+      });
+    }
   }
 
   const stopLocale = api.onLocaleChange((nextLocale) => {
@@ -839,8 +885,25 @@ export async function mount(root, api) {
     void refreshAll(true);
   }, api.signal);
 
+  const stopNavigation = subscribeNavigationIntent(
+    (view) => {
+      pendingScrollTarget = null;
+      applyNavigationIntent(view, true);
+    },
+    api.signal,
+    { win: root.ownerDocument?.defaultView },
+  );
+
   render();
+  if (pendingScrollTarget) {
+    scrollToTarget(pendingScrollTarget);
+  }
   await refreshAll(false);
+  if (pendingScrollTarget) {
+    const target = pendingScrollTarget;
+    pendingScrollTarget = null;
+    scrollToTarget(target);
+  }
   refreshTimer = setInterval(() => {
     if (!document.hidden) void refreshAll(true);
   }, 60_000);
@@ -849,6 +912,7 @@ export async function mount(root, api) {
     stopLocale();
     stopStorage();
     stopBroadcast();
+    stopNavigation();
     if (bannerTimer !== null) clearTimeout(bannerTimer);
     if (refreshTimer !== null) clearInterval(refreshTimer);
     if (fastPollTimer !== null) clearTimeout(fastPollTimer);

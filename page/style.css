@@ -149,6 +149,19 @@
   color: var(--cx-page-danger);
 }
 
+.aag-stat-card.is-clickable {
+  cursor: pointer;
+  transition: border-color 120ms ease;
+}
+
+.aag-stat-card.is-clickable:hover {
+  border-color: var(--cx-page-accent);
+}
+
+.aag-stat-card.is-warn.is-clickable:hover {
+  border-color: var(--cx-page-danger);
+}
+
 .aag-card {
   padding: 16px 18px;
   border-radius: var(--cx-page-radius);

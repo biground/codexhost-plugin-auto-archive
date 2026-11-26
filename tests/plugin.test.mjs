@@ -4,8 +4,24 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { activate, evaluateThread, normalizeSettings, resolveThreadProject } from "../backend/index.mjs";
+import {
+  activate,
+  DEFAULT_SETTINGS as BACKEND_DEFAULT_SETTINGS,
+  evaluateThread,
+  isRetryableCatalogError,
+  normalizeSettings,
+  readAllActiveThreads,
+  readAllArchivedThreads,
+  resolveThreadProject,
+} from "../backend/index.mjs";
+import {
+  consumeNavigationIntent,
+  DEFAULT_SETTINGS as SHARED_DEFAULT_SETTINGS,
+  publishNavigationIntent,
+  subscribeNavigationIntent,
+} from "../shared/common.mjs";
 import { parseSessionIdFromRowKey } from "../web/index.mjs";
+import { DESKTOP_PAGE_ID, mount as mountWidget, openPluginPage, resolveWidgetClickTarget } from "../widget/index.mjs";
 
 const PLUGIN_ROOT = path.resolve(import.meta.dirname, "..");
 const CODEXHOST_CONTRACTS = path.resolve(
@@ -314,4 +330,392 @@ test("resolveThreadProject matches explicit assignments, longest rootPath prefix
     resolveThreadProject({ id: "t-unknown", cwd: "D:\\other" }, workspace),
     { projectId: null, projectName: "" },
   );
+});
+
+test("showWidget defaults to false across manifest, shared defaults, and backend defaults", async () => {
+  const rawManifest = JSON.parse(await readFile(path.join(PLUGIN_ROOT, "manifest.json"), "utf8"));
+  const showWidgetSchema = rawManifest.settingsSchema.find((item) => item.key === "showWidget");
+  assert.ok(showWidgetSchema);
+  assert.equal(showWidgetSchema.default, false);
+  assert.equal(SHARED_DEFAULT_SETTINGS.showWidget, false);
+  assert.equal(BACKEND_DEFAULT_SETTINGS.showWidget, false);
+  assert.equal(normalizeSettings({}).showWidget, false);
+  assert.equal(normalizeSettings({ showWidget: true }).showWidget, true);
+});
+
+test("resolveWidgetClickTarget routes to expiring when pending/expired exists and home otherwise", () => {
+  assert.equal(resolveWidgetClickTarget({ expiredCount: 3, pendingCount: 0 }), "expiring");
+  assert.equal(resolveWidgetClickTarget({ expiredCount: 0, pendingCount: 2 }), "expiring");
+  assert.equal(resolveWidgetClickTarget({ expiredCount: 2, pendingCount: 1 }), "expiring");
+  assert.equal(resolveWidgetClickTarget({ expiredCount: 0, pendingCount: 0 }), "home");
+  assert.equal(resolveWidgetClickTarget(null), "home");
+});
+
+test("navigation intent publishes, consumes once, expires stale entries, and notifies subscribers", () => {
+  const map = new Map();
+  const storage = {
+    getItem: (k) => (map.has(k) ? map.get(k) : null),
+    setItem: (k, v) => map.set(k, String(v)),
+    removeItem: (k) => map.delete(k),
+  };
+  const listeners = new Map();
+  const win = {
+    sessionStorage: storage,
+    CustomEvent: class FakeCustomEvent {
+      constructor(type, init) {
+        this.type = type;
+        this.detail = init?.detail;
+      }
+    },
+    addEventListener(type, fn) {
+      listeners.set(type, fn);
+    },
+    removeEventListener(type) {
+      listeners.delete(type);
+    },
+    dispatchEvent(event) {
+      listeners.get(event.type)?.(event);
+    },
+  };
+
+  // Cold-open path: publish then consume once
+  publishNavigationIntent("expiring", { win, storage, now: 10_000, BroadcastChannel: null });
+  assert.equal(consumeNavigationIntent({ win, storage, now: 12_000 }), "expiring");
+  assert.equal(consumeNavigationIntent({ win, storage, now: 12_000 }), null);
+
+  // Stale intent expires
+  publishNavigationIntent("home", { win, storage, now: 10_000, BroadcastChannel: null });
+  assert.equal(consumeNavigationIntent({ win, storage, now: 30_000, maxAgeMs: 15_000 }), null);
+
+  // Live subscriber receives event immediately and clears stored intent
+  const received = [];
+  const ac = new AbortController();
+  subscribeNavigationIntent((view) => received.push(view), ac.signal, {
+    win,
+    storage,
+    BroadcastChannel: null,
+  });
+  publishNavigationIntent("expiring", { win, storage, now: 50_000, BroadcastChannel: null });
+  publishNavigationIntent("home", { win, storage, now: 51_000, BroadcastChannel: null });
+  assert.deepEqual(received, ["expiring", "home"]);
+  assert.equal(consumeNavigationIntent({ win, storage, now: 51_500 }), null);
+  ac.abort();
+});
+
+test("openPluginPage handles Desktop (active, direct, deferred) and Web (active, tab, sidebar)", async () => {
+  // Desktop: already active on plugin page
+  {
+    const calls = [];
+    const res = openPluginPage({
+      hostTarget: "desktop",
+      win: {
+        __codexhostSettingsShellV1: {
+          open: true,
+          activePageId: DESKTOP_PAGE_ID,
+          openSettings: (...args) => {
+            calls.push(args);
+            return true;
+          },
+        },
+      },
+    });
+    assert.equal(res.opened, true);
+    assert.equal(res.mode, "desktop-active");
+    assert.equal(calls.length, 0);
+  }
+
+  // Desktop: direct open succeeds
+  {
+    const openedPages = [];
+    const res = openPluginPage({
+      hostTarget: "desktop",
+      win: {
+        __codexhostSettingsShellV1: {
+          open: false,
+          activePageId: "general",
+          openSettings: (_opener, pageId) => {
+            openedPages.push(pageId);
+            return pageId === DESKTOP_PAGE_ID;
+          },
+        },
+      },
+    });
+    assert.equal(res.opened, true);
+    assert.equal(res.mode, "desktop-direct");
+    assert.deepEqual(openedPages, [DESKTOP_PAGE_ID]);
+  }
+
+  // Desktop: cold start falls back to desktop-extensions then navigates once synced
+  {
+    const openedPages = [];
+    const navigated = [];
+    let ready = false;
+    const ac = new AbortController();
+    const res = openPluginPage({
+      hostTarget: "desktop",
+      signal: ac.signal,
+      pollIntervalMs: 10,
+      maxAttempts: 10,
+      win: {
+        __codexhostSettingsShellV1: {
+          open: false,
+          activePageId: "general",
+          openSettings: (_opener, pageId) => {
+            openedPages.push(pageId);
+            if (pageId === "desktop-extensions") {
+              setTimeout(() => {
+                ready = true;
+              }, 15);
+              return true;
+            }
+            return false;
+          },
+          navigateToPage: (pageId) => {
+            navigated.push(pageId);
+            return ready && pageId === DESKTOP_PAGE_ID;
+          },
+        },
+      },
+    });
+    assert.equal(res.opened, true);
+    assert.equal(res.mode, "desktop-deferred");
+    assert.deepEqual(openedPages, [DESKTOP_PAGE_ID, "desktop-extensions"]);
+    await new Promise((r) => setTimeout(r, 60));
+    assert.ok(navigated.includes(DESKTOP_PAGE_ID));
+    ac.abort();
+  }
+
+  // Web: already active page
+  {
+    const res = openPluginPage({
+      hostTarget: "web",
+      win: {},
+      doc: {
+        querySelector: (sel) => (sel === '[data-host-extension-page="auto-archive-guard"]' ? {} : null),
+      },
+    });
+    assert.equal(res.opened, true);
+    assert.equal(res.mode, "web-active");
+  }
+
+  // Web: clicks sidebar Plugins button then selects plugin tab when rendered
+  {
+    let sidebarClicked = false;
+    let tabClicked = false;
+    let tabMounted = false;
+    const ac = new AbortController();
+    const tabBtn = { click: () => { tabClicked = true; } };
+    const sidebarBtn = {
+      click: () => {
+        sidebarClicked = true;
+        setTimeout(() => {
+          tabMounted = true;
+        }, 15);
+      },
+    };
+    const res = openPluginPage({
+      hostTarget: "web",
+      win: {},
+      signal: ac.signal,
+      pollIntervalMs: 10,
+      maxAttempts: 10,
+      doc: {
+        querySelector: (sel) => {
+          if (sel.includes("-page-auto-archive-guard")) return tabMounted ? tabBtn : null;
+          if (sel.includes('aria-label="插件"')) return sidebarBtn;
+          return null;
+        },
+        querySelectorAll: () => [],
+      },
+    });
+    assert.equal(res.opened, true);
+    assert.equal(res.mode, "web-sidebar");
+    assert.equal(sidebarClicked, true);
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(tabClicked, true);
+    ac.abort();
+  }
+});
+
+test("widget stays hidden by default and only renders & navigates when showWidget is enabled", async () => {
+  const storageMap = new Map();
+  const winEvents = [];
+  const fakeWindow = {
+    sessionStorage: {
+      getItem: (k) => (storageMap.has(k) ? storageMap.get(k) : null),
+      setItem: (k, v) => storageMap.set(k, String(v)),
+      removeItem: (k) => storageMap.delete(k),
+    },
+    CustomEvent: class FakeCustomEvent {
+      constructor(type, init) {
+        this.type = type;
+        this.detail = init?.detail;
+      }
+    },
+    dispatchEvent: (ev) => winEvents.push(ev),
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    __codexhostSettingsShellV1: {
+      open: false,
+      activePageId: "general",
+      opened: [],
+      openSettings(_opener, pageId) {
+        this.opened.push(pageId);
+        return true;
+      },
+    },
+  };
+
+  let clickHandler = null;
+  let renderedHtml = "";
+  let replacedCount = 0;
+  const fakeRoot = {
+    ownerDocument: { defaultView: fakeWindow },
+    replaceChildren() {
+      renderedHtml = "";
+      clickHandler = null;
+      replacedCount += 1;
+    },
+    set innerHTML(val) {
+      renderedHtml = val;
+    },
+    get innerHTML() {
+      return renderedHtml;
+    },
+    querySelector(sel) {
+      if (sel === "[data-w-open]" && renderedHtml.includes("data-w-open")) {
+        return {
+          addEventListener(type, fn) {
+            if (type === "click") clickHandler = fn;
+          },
+        };
+      }
+      return null;
+    },
+  };
+
+  let backendCalls = 0;
+  let expiredCount = 2;
+  let storageListener = null;
+  const ac = new AbortController();
+  const cleanup = await mountWidget(fakeRoot, {
+    locale: "zh-CN",
+    hostTarget: "desktop",
+    signal: ac.signal,
+    onLocaleChange: () => () => {},
+    storage: {
+      get: async () => ({}),
+      onChange: (fn) => {
+        storageListener = fn;
+        return () => {};
+      },
+    },
+    backend: {
+      invoke: async () => {
+        backendCalls += 1;
+        return {
+          settings: { showWidget: true, enabled: true, retentionDays: 3 },
+          stats: { totalActive: 5, expiredCount, pendingCount: 0, protectedActiveCount: 1 },
+        };
+      },
+    },
+  });
+
+  try {
+    // Default showWidget: false -> nothing rendered, no backend polling
+    assert.equal(renderedHtml, "");
+    assert.ok(replacedCount >= 1);
+    assert.equal(backendCalls, 0);
+
+    // Enabling showWidget renders the pill and syncs backend state
+    storageListener({ showWidget: true, enabled: true, retentionDays: 3 });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.ok(renderedHtml.includes("aag-widget-pill"));
+    assert.ok(renderedHtml.includes("aag-pill-badge"));
+    assert.ok(typeof clickHandler === "function");
+
+    // Clicking when expiredCount > 0 routes to "expiring" and opens plugin page
+    clickHandler();
+    assert.equal(consumeNavigationIntent({ win: fakeWindow }), "expiring");
+    assert.equal(fakeWindow.__codexhostSettingsShellV1.opened.at(-1), DESKTOP_PAGE_ID);
+
+    // When expiredCount becomes 0, clicking routes to "home"
+    expiredCount = 0;
+    storageListener({ showWidget: true, enabled: true, retentionDays: 3 });
+    // Trigger syncState via protected change isn't needed; re-enable toggle forces sync
+    storageListener({ showWidget: false });
+    assert.equal(renderedHtml, "");
+    storageListener({ showWidget: true, enabled: true, retentionDays: 3 });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.ok(!renderedHtml.includes("aag-pill-badge"));
+    clickHandler();
+    assert.equal(consumeNavigationIntent({ win: fakeWindow }), "home");
+  } finally {
+    ac.abort();
+    cleanup();
+  }
+});
+
+test("catalog pagination retries transient page-0 timeout and gracefully stops on deeper-page timeouts", async () => {
+  const timeoutErr = new DOMException("The operation was aborted due to timeout", "TimeoutError");
+  assert.equal(isRetryableCatalogError(timeoutErr), true);
+  assert.equal(isRetryableCatalogError(new Error("Thread catalog aggregation failed")), true);
+  assert.equal(isRetryableCatalogError(new Error("Unauthorized")), false);
+
+  // Page 0 fails once with TimeoutError then succeeds; page 1 times out -> graceful partial result
+  let page0Calls = 0;
+  let page1Calls = 0;
+  const activeRes = await readAllActiveThreads(
+    {
+      request: async (method, params) => {
+        if (method === "codexhost/thread/pins/list") return { threadIds: [] };
+        if (method === "codexhost/thread/tree/snapshot") return { nodes: {} };
+        if (method === "codexhost/thread/catalog/read") {
+          if (!params?.officialCursor?.live) {
+            page0Calls += 1;
+            if (page0Calls === 1) throw timeoutErr;
+            return {
+              threads: [{ id: "t-1", name: "Recent", updatedAt: 1_700_000_000 }],
+              ownership: [{ threadId: "t-1", owner: "codex" }],
+              archivedThreadIds: [],
+              officialCursor: { live: "cursor-page-1" },
+            };
+          }
+          page1Calls += 1;
+          throw timeoutErr;
+        }
+        return {};
+      },
+    },
+    { retryDelayMs: 5 },
+  );
+  assert.equal(page0Calls, 2);
+  assert.equal(page1Calls, 1);
+  assert.equal(activeRes.truncated, true);
+  assert.equal(activeRes.threads.length, 1);
+  assert.equal(activeRes.threads[0].id, "t-1");
+
+  // Archived catalog also gracefully stops on page > 0 timeout
+  let archPage1Calls = 0;
+  const archivedRes = await readAllArchivedThreads(
+    {
+      request: async (_method, params) => {
+        if (!params?.officialCursor?.archived) {
+          return {
+            threads: [{ id: "a-1", name: "Old Archived", updatedAt: 1_600_000_000 }],
+            ownership: [{ threadId: "a-1", owner: "codex" }],
+            archivedThreadIds: ["a-1"],
+            officialCursor: { live: null, archived: "arch-cursor-1" },
+          };
+        }
+        archPage1Calls += 1;
+        throw new Error("Thread catalog aggregation failed");
+      },
+    },
+    { retryDelayMs: 5 },
+  );
+  assert.equal(archPage1Calls, 1);
+  assert.equal(archivedRes.truncated, true);
+  assert.equal(archivedRes.threads.length, 1);
+  assert.equal(archivedRes.threads[0].id, "a-1");
 });

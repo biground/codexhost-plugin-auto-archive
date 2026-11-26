@@ -8,9 +8,10 @@ const MAX_CATALOG_PAGES = 100;
 const MAX_ARCHIVED_RETURN = 2000;
 const MAX_HISTORY_ITEMS = 200;
 const INITIAL_SWEEP_DELAY_MS = 120_000;
-const CATALOG_TTL_MS = 45_000;
-const ARCHIVED_TTL_MS = 90_000;
-const RPC_TIMEOUT_MS = 25_000;
+const CATALOG_TTL_MS = 120_000;
+const ARCHIVED_TTL_MS = 180_000;
+const RPC_TIMEOUT_MS = 35_000;
+const PAGE_RETRY_DELAY_MS = 500;
 
 export const DEFAULT_SETTINGS = Object.freeze({
   enabled: true,
@@ -19,7 +20,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   checkIntervalMinutes: 1440,
   graceMinutes: 30,
   skipPinned: true,
-  showWidget: true,
+  showWidget: false,
 });
 
 export function normalizeSettings(raw) {
@@ -389,10 +390,47 @@ export async function readWorkspaceMetadata(rpc, threadIds = []) {
   }
 }
 
+export function isRetryableCatalogError(error) {
+  const name = typeof error?.name === "string" ? error.name : "";
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return (
+    name === "TimeoutError" ||
+    name === "AbortError" ||
+    /timeout|timed out|aborted|catalog aggregation failed|list aggregation failed|-32082/iu.test(
+      message,
+    )
+  );
+}
+
+async function requestCatalogPageWithRetry(rpc, params, options = {}) {
+  const retryDelayMs =
+    typeof options.retryDelayMs === "number" ? options.retryDelayMs : PAGE_RETRY_DELAY_MS;
+  const maxRetries = typeof options.maxRetries === "number" ? options.maxRetries : 1;
+  let lastError = null;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await rpc.request("codexhost/thread/catalog/read", params);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= maxRetries || !isRetryableCatalogError(error) || options.isAborted?.()) {
+        throw error;
+      }
+      if (retryDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+      }
+      if (options.isAborted?.()) {
+        throw error;
+      }
+    }
+  }
+  throw lastError;
+}
+
 export async function readAllActiveThreads(rpc, options = {}) {
-  const { onPage, isAborted } = options;
+  const { onPage, isAborted, retryDelayMs } = options;
   const byId = new Map();
   const ownershipMap = new Map();
+  let truncated = false;
 
   const [pinsResult, treeResult] = await Promise.all([
     rpc.request("codexhost/thread/pins/list", {}).catch(() => null),
@@ -412,7 +450,23 @@ export async function readAllActiveThreads(rpc, options = {}) {
     const params = cursor
       ? { includeArchived: false, officialCursor: { live: cursor } }
       : { includeArchived: false };
-    const result = await rpc.request("codexhost/thread/catalog/read", params);
+    let result;
+    try {
+      result = await requestCatalogPageWithRetry(rpc, params, {
+        isAborted,
+        retryDelayMs,
+        maxRetries: page === 0 ? 1 : 0,
+      });
+    } catch (error) {
+      // Deep native Codex pages can hit official app-server scan timeouts; keep
+      // already-fetched pages (which include all external threads + recent native
+      // threads) instead of failing the whole catalog refresh.
+      if (page > 0 && isRetryableCatalogError(error)) {
+        truncated = true;
+        break;
+      }
+      throw error;
+    }
     const threads = Array.isArray(result?.threads) ? result.threads : [];
     const ownerships = Array.isArray(result?.ownership) ? result.ownership : [];
     const archivedSet = new Set(
@@ -434,6 +488,7 @@ export async function readAllActiveThreads(rpc, options = {}) {
       ownershipMap: new Map(ownershipMap),
       pinnedSet,
       treeNodes,
+      truncated,
     });
     const nextCursor = result?.officialCursor?.live ?? null;
     if (!nextCursor || nextCursor === cursor) break;
@@ -445,13 +500,15 @@ export async function readAllActiveThreads(rpc, options = {}) {
     ownershipMap,
     pinnedSet,
     treeNodes,
+    truncated,
   };
 }
 
 export async function readAllArchivedThreads(rpc, options = {}) {
-  const { onPage, isAborted } = options;
+  const { onPage, isAborted, retryDelayMs } = options;
   const byId = new Map();
   const ownershipMap = new Map();
+  let truncated = false;
 
   let archivedCursor = undefined;
   for (let page = 0; page < MAX_CATALOG_PAGES; page++) {
@@ -461,7 +518,20 @@ export async function readAllArchivedThreads(rpc, options = {}) {
       archivedCursor === undefined
         ? { includeArchived: true, officialCursor: { live: null } }
         : { includeArchived: true, officialCursor: { live: null, archived: archivedCursor } };
-    const result = await rpc.request("codexhost/thread/catalog/read", params);
+    let result;
+    try {
+      result = await requestCatalogPageWithRetry(rpc, params, {
+        isAborted,
+        retryDelayMs,
+        maxRetries: page === 0 ? 1 : 0,
+      });
+    } catch (error) {
+      if (page > 0 && isRetryableCatalogError(error)) {
+        truncated = true;
+        break;
+      }
+      throw error;
+    }
     const threads = Array.isArray(result?.threads) ? result.threads : [];
     const ownerships = Array.isArray(result?.ownership) ? result.ownership : [];
     const archivedSet = new Set(
@@ -481,6 +551,7 @@ export async function readAllArchivedThreads(rpc, options = {}) {
     onPage?.({
       threads: [...byId.values()],
       ownershipMap: new Map(ownershipMap),
+      truncated,
     });
     const nextCursor = result?.officialCursor?.archived ?? null;
     if (!nextCursor || nextCursor === archivedCursor) break;
@@ -490,6 +561,7 @@ export async function readAllArchivedThreads(rpc, options = {}) {
   return {
     threads: [...byId.values()],
     ownershipMap,
+    truncated,
   };
 }
 
@@ -546,6 +618,7 @@ export async function activate(ctx, options = {}) {
     treeNodes: {},
     updatedAt: 0,
     hostConnected: false,
+    truncated: false,
     error: null,
   };
   let catalogRefreshPromise = null;
@@ -554,6 +627,7 @@ export async function activate(ctx, options = {}) {
     threads: [],
     ownershipMap: new Map(),
     updatedAt: 0,
+    truncated: false,
     error: null,
   };
   let archivedRefreshPromise = null;
@@ -677,6 +751,7 @@ export async function activate(ctx, options = {}) {
         }
         const fresh = await readAllActiveThreads(rpc, {
           isAborted: () => disposed,
+          retryDelayMs: options.pageRetryDelayMs,
           onPage: (partial) => {
             if (disposed) return;
             catalogCache = {
@@ -698,9 +773,18 @@ export async function activate(ctx, options = {}) {
         }
       } catch (error) {
         if (!disposed) {
+          // If we already hold a cached catalog and hit a transient timeout, keep serving
+          // the cached threads quietly instead of surfacing a scary red error banner.
+          const transientWithCache =
+            catalogCache.threads.length > 0 && isRetryableCatalogError(error);
           catalogCache = {
             ...catalogCache,
-            error: error instanceof Error ? error.message : String(error),
+            updatedAt: transientWithCache ? nowFn() : catalogCache.updatedAt,
+            error: transientWithCache
+              ? null
+              : error instanceof Error
+                ? error.message
+                : String(error),
           };
         }
       } finally {
@@ -733,6 +817,7 @@ export async function activate(ctx, options = {}) {
         }
         const fresh = await readAllArchivedThreads(rpc, {
           isAborted: () => disposed,
+          retryDelayMs: options.pageRetryDelayMs,
           onPage: (partial) => {
             if (disposed) return;
             archivedCache = {
@@ -752,9 +837,16 @@ export async function activate(ctx, options = {}) {
         }
       } catch (error) {
         if (!disposed) {
+          const transientWithCache =
+            archivedCache.threads.length > 0 && isRetryableCatalogError(error);
           archivedCache = {
             ...archivedCache,
-            error: error instanceof Error ? error.message : String(error),
+            updatedAt: transientWithCache ? nowFn() : archivedCache.updatedAt,
+            error: transientWithCache
+              ? null
+              : error instanceof Error
+                ? error.message
+                : String(error),
           };
         }
       } finally {
@@ -1135,6 +1227,8 @@ export async function activate(ctx, options = {}) {
       projects: workspaceCache.projects.map(({ id, name }) => ({ id, name })),
       hostConnected: online,
       hostError: catalogCache.error,
+      catalogTruncated: Boolean(catalogCache.truncated),
+      archivedTruncated: Boolean(archivedCache.truncated),
       refreshing: Boolean(catalogRefreshPromise),
       archivedRefreshing: Boolean(archivedRefreshPromise),
       catalogUpdatedAt: catalogCache.updatedAt || null,
@@ -1175,6 +1269,8 @@ export async function activate(ctx, options = {}) {
       projects: workspaceCache.projects.map(({ id, name }) => ({ id, name })),
       hostConnected: online,
       hostError: catalogCache.error,
+      catalogTruncated: Boolean(catalogCache.truncated),
+      archivedTruncated: Boolean(archivedCache.truncated),
       refreshing: Boolean(catalogRefreshPromise),
       catalogUpdatedAt: catalogCache.updatedAt || null,
       threads: items,
@@ -1200,6 +1296,7 @@ export async function activate(ctx, options = {}) {
       projects: workspaceCache.projects.map(({ id, name }) => ({ id, name })),
       hostConnected: online,
       archivedError: archivedCache.error,
+      archivedTruncated: Boolean(archivedCache.truncated),
       refreshing: Boolean(archivedRefreshPromise),
       updatedAt: archivedCache.updatedAt || null,
       archived: items,

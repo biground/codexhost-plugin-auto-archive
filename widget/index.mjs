@@ -1,15 +1,14 @@
 import {
-  broadcastProtectedChange,
   createMessages,
-  formatCountdown,
-  formatDaysAgo,
-  normalizeProtectedIds,
   normalizeSettings,
+  publishNavigationIntent,
   shieldSvg,
   subscribeProtectedChange,
+  subscribeSettingsChange,
 } from "../shared/common.mjs";
 
-const COLLAPSED_KEY = "cx.auto-archive-guard.widget.expanded";
+export const EXTENSION_ID = "auto-archive-guard";
+export const DESKTOP_PAGE_ID = `plugin-${EXTENSION_ID}`;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -19,44 +18,141 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
+export function resolveWidgetClickTarget(stats) {
+  const expiredCount = Number(stats?.expiredCount ?? 0);
+  const pendingCount = Number(stats?.pendingCount ?? 0);
+  return expiredCount > 0 || pendingCount > 0 ? "expiring" : "home";
+}
+
+function findWebPluginTab(doc, extensionId = EXTENSION_ID) {
+  const selector = `[data-plugins-section] [role="tab"][id$="-page-${extensionId}"]`;
+  return doc?.querySelector?.(selector) ?? null;
+}
+
+function findWebPluginsSidebarButton(doc) {
+  if (!doc?.querySelector) return null;
+  const direct = doc.querySelector(
+    'nav button[aria-label="插件"], nav button[aria-label="Plugins"]',
+  );
+  if (direct) return direct;
+  const candidates = doc.querySelectorAll?.("nav button, button[aria-label]") ?? [];
+  for (const btn of candidates) {
+    const label = (btn.getAttribute?.("aria-label") || btn.textContent || "").trim();
+    if (/^(插件|plugins)$/iu.test(label)) {
+      return btn;
+    }
+  }
+  return null;
+}
+
+export function openPluginPage({
+  doc = typeof document !== "undefined" ? document : null,
+  win = typeof window !== "undefined" ? window : null,
+  hostTarget = "web",
+  signal,
+  pollIntervalMs = 80,
+  maxAttempts = 40,
+} = {}) {
+  let retryTimer = null;
+  const stopRetry = () => {
+    if (retryTimer !== null) {
+      clearInterval(retryTimer);
+      retryTimer = null;
+    }
+  };
+  signal?.addEventListener?.("abort", stopRetry, { once: true });
+
+  const shell = win?.__codexhostSettingsShellV1;
+  if (hostTarget === "desktop" || shell) {
+    if (shell) {
+      if (shell.open && shell.activePageId === DESKTOP_PAGE_ID) {
+        return { opened: true, mode: "desktop-active", cancel: stopRetry };
+      }
+      if (shell.openSettings?.(undefined, DESKTOP_PAGE_ID)) {
+        return { opened: true, mode: "desktop-direct", cancel: stopRetry };
+      }
+      if (shell.openSettings?.(undefined, "desktop-extensions") || shell.openSettings?.()) {
+        let attempts = 0;
+        retryTimer = setInterval(() => {
+          attempts += 1;
+          if (signal?.aborted) {
+            stopRetry();
+            return;
+          }
+          if (shell.navigateToPage?.(DESKTOP_PAGE_ID) || attempts >= maxAttempts) {
+            stopRetry();
+          }
+        }, pollIntervalMs);
+        return { opened: true, mode: "desktop-deferred", cancel: stopRetry };
+      }
+    }
+    const triggerBtn = doc?.querySelector?.("[data-codexhost-settings-trigger] button");
+    if (triggerBtn) {
+      triggerBtn.click();
+      return { opened: true, mode: "desktop-trigger", cancel: stopRetry };
+    }
+    return { opened: false, mode: "desktop-unavailable", cancel: stopRetry };
+  }
+
+  if (doc?.querySelector?.(`[data-host-extension-page="${EXTENSION_ID}"]`)) {
+    return { opened: true, mode: "web-active", cancel: stopRetry };
+  }
+
+  const existingTab = findWebPluginTab(doc);
+  if (existingTab) {
+    existingTab.click();
+    return { opened: true, mode: "web-tab", cancel: stopRetry };
+  }
+
+  const sidebarBtn = findWebPluginsSidebarButton(doc);
+  if (sidebarBtn) {
+    sidebarBtn.click();
+    let attempts = 0;
+    const trySelectTab = () => {
+      if (signal?.aborted) {
+        stopRetry();
+        return true;
+      }
+      if (doc?.querySelector?.(`[data-host-extension-page="${EXTENSION_ID}"]`)) {
+        stopRetry();
+        return true;
+      }
+      const tab = findWebPluginTab(doc);
+      if (tab) {
+        tab.click();
+        stopRetry();
+        return true;
+      }
+      return false;
+    };
+    if (!trySelectTab()) {
+      retryTimer = setInterval(() => {
+        attempts += 1;
+        if (trySelectTab() || attempts >= maxAttempts) {
+          stopRetry();
+        }
+      }, pollIntervalMs);
+    }
+    return { opened: true, mode: "web-sidebar", cancel: stopRetry };
+  }
+
+  return { opened: false, mode: "web-unavailable", cancel: stopRetry };
+}
+
 export async function mount(root, api) {
   let locale = api.locale || "en";
-  let expanded = false;
-  try {
-    expanded = localStorage.getItem(COLLAPSED_KEY) === "1";
-  } catch {
-    expanded = false;
-  }
-
   let settings = normalizeSettings(await api.storage.get().catch(() => ({})));
-  let protectedThreadIds = [];
-  let nowMs = Date.now();
-  let stats = { totalActive: 0, expiredCount: 0, pendingCount: 0, protectedActiveCount: 0, expiringPreview: [] };
-  let busy = false;
-  let notice = "";
-  let noticeTimer = null;
+  let stats = { totalActive: 0, expiredCount: 0, pendingCount: 0, protectedActiveCount: 0 };
   let pollTimer = null;
-
-  function setNotice(text) {
-    if (noticeTimer !== null) clearTimeout(noticeTimer);
-    notice = text;
-    render();
-    noticeTimer = setTimeout(() => {
-      noticeTimer = null;
-      notice = "";
-      render();
-    }, 3000);
-  }
+  let cancelNav = null;
 
   async function syncState() {
-    if (api.signal.aborted) return;
+    if (api.signal.aborted || !settings.showWidget) return;
     try {
       const result = await api.backend.invoke("getState");
       if (api.signal.aborted) return;
       if (result && typeof result === "object") {
         settings = normalizeSettings(result.settings);
-        protectedThreadIds = normalizeProtectedIds(result.protectedThreadIds);
-        nowMs = result.nowMs ?? Date.now();
         stats = result.stats ?? stats;
       }
       render();
@@ -65,58 +161,18 @@ export async function mount(root, api) {
     }
   }
 
-  async function toggleEnabled() {
-    if (busy) return;
-    busy = true;
-    render();
-    try {
-      const next = { ...settings, enabled: !settings.enabled };
-      const result = await api.backend.invoke("updateSettings", next);
-      if (result?.settings) settings = normalizeSettings(result.settings);
-      else settings = normalizeSettings(next);
-      await syncState();
-    } finally {
-      busy = false;
-      if (!api.signal.aborted) render();
-    }
-  }
-
-  async function quickSweep() {
-    if (busy) return;
-    busy = true;
-    render();
-    const msg = createMessages(locale);
-    try {
-      await api.backend.invoke("runSweep", { dryRun: false, async: true });
-      setNotice(locale.toLowerCase().startsWith("zh") ? "已开始后台归档超期会话…" : "Archiving expired sessions…");
-      setTimeout(() => void syncState(), 2000);
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : String(error));
-    } finally {
-      busy = false;
-      if (!api.signal.aborted) render();
-    }
-  }
-
-  async function protectThread(threadId, title) {
-    if (busy) return;
-    busy = true;
-    render();
-    try {
-      const result = await api.backend.invoke("toggleProtect", {
-        threadId,
-        protected: true,
-        title,
-      });
-      if (result && Array.isArray(result.protectedThreadIds)) {
-        protectedThreadIds = normalizeProtectedIds(result.protectedThreadIds);
-        broadcastProtectedChange(protectedThreadIds);
-      }
-      await syncState();
-    } finally {
-      busy = false;
-      if (!api.signal.aborted) render();
-    }
+  function handlePillClick() {
+    const target = resolveWidgetClickTarget(stats);
+    const win = root.ownerDocument?.defaultView ?? (typeof window !== "undefined" ? window : null);
+    publishNavigationIntent(target, { win });
+    cancelNav?.();
+    const nav = openPluginPage({
+      doc: root.ownerDocument,
+      win,
+      hostTarget: api.hostTarget,
+      signal: api.signal,
+    });
+    cancelNav = nav.cancel;
   }
 
   function render() {
@@ -126,100 +182,37 @@ export async function mount(root, api) {
       return;
     }
     const msg = createMessages(locale);
-    const preview = Array.isArray(stats.expiringPreview) ? stats.expiringPreview.slice(0, 4) : [];
+    const dueCount = Math.max(Number(stats.expiredCount ?? 0), Number(stats.pendingCount ?? 0));
+    const tooltip = dueCount > 0 ? msg.widgetOpenPending(dueCount) : msg.widgetOpenHome;
 
     root.innerHTML = `
       <div class="aag-widget-layer">
-        <div class="aag-widget-shell ${expanded ? "is-expanded" : ""}">
-          ${
-            expanded
-              ? `<div class="aag-widget-panel">
-                  <div class="aag-widget-head">
-                    <span class="aag-widget-title">${shieldSvg(true)} ${escapeHtml(msg.widgetTitle)}</span>
-                    <button type="button" class="aag-w-icon-btn" data-w-toggle aria-label="${escapeHtml(msg.widgetClose)}">✕</button>
-                  </div>
-                  <div class="aag-widget-summary">
-                    <span>${escapeHtml(settings.enabled ? msg.widgetRunning(settings.retentionDays) : msg.widgetPaused)}</span>
-                    <span>·</span>
-                    <span>${escapeHtml(msg.widgetProtectedShort(protectedThreadIds.length))}</span>
-                    <span>·</span>
-                    <span class="${stats.expiredCount > 0 ? "is-due" : ""}">${escapeHtml(msg.widgetExpiringShort(stats.expiredCount))}</span>
-                  </div>
-                  ${notice ? `<div class="aag-widget-notice">${escapeHtml(notice)}</div>` : ""}
-                  <div class="aag-widget-preview">
-                    ${
-                      preview.length === 0
-                        ? `<div class="aag-widget-empty">${escapeHtml(msg.widgetNoExpiring)}</div>`
-                        : preview
-                            .map(
-                              (item) => `
-                          <div class="aag-widget-item">
-                            <div class="aag-widget-item-text">
-                              <div class="aag-widget-item-title">${escapeHtml(item.title)}</div>
-                              <div class="aag-widget-item-age">${escapeHtml(
-                                item.pendingDueAt !== null
-                                  ? formatCountdown(item.pendingDueAt, nowMs, locale)
-                                  : formatDaysAgo(item.daysInactive, locale),
-                              )}</div>
-                            </div>
-                            <button
-                              type="button"
-                              class="aag-w-keep-btn"
-                              data-w-protect="${escapeHtml(item.id)}"
-                              data-w-title="${escapeHtml(item.title)}"
-                              title="${escapeHtml(msg.protectAction)}"
-                            >${shieldSvg(false)}</button>
-                          </div>
-                        `,
-                            )
-                            .join("")
-                    }
-                  </div>
-                  <div class="aag-widget-actions">
-                    <button type="button" class="aag-w-btn" data-w-enabled ${busy ? "disabled" : ""}>
-                      ${escapeHtml(settings.enabled ? msg.widgetPaused : msg.autoEnabled)}
-                    </button>
-                    <button type="button" class="aag-w-btn is-accent" data-w-sweep ${busy || stats.expiredCount === 0 ? "disabled" : ""}>
-                      ${escapeHtml(msg.runNow)}
-                    </button>
-                  </div>
-                </div>`
-              : `<button type="button" class="aag-widget-pill" data-w-toggle title="${escapeHtml(msg.widgetOpen)}">
-                  <span class="aag-pill-icon ${settings.enabled ? "is-on" : ""}">${shieldSvg(true)}</span>
-                  <span class="aag-pill-text">${escapeHtml(settings.enabled ? msg.widgetRunning(settings.retentionDays) : msg.widgetPaused)}</span>
-                  ${stats.expiredCount > 0 ? `<span class="aag-pill-badge is-due">${stats.expiredCount}</span>` : ""}
-                </button>`
-          }
+        <div class="aag-widget-shell">
+          <button
+            type="button"
+            class="aag-widget-pill ${dueCount > 0 ? "has-due" : ""}"
+            data-w-open
+            title="${escapeHtml(tooltip)}"
+            aria-label="${escapeHtml(tooltip)}"
+          >
+            <span class="aag-pill-icon ${settings.enabled ? "is-on" : ""}">${shieldSvg(true)}</span>
+            <span class="aag-pill-text">${escapeHtml(settings.enabled ? msg.widgetRunning(settings.retentionDays) : msg.widgetPaused)}</span>
+            ${dueCount > 0 ? `<span class="aag-pill-badge is-due">${dueCount}</span>` : ""}
+          </button>
         </div>
       </div>
     `;
 
-    root.querySelector("[data-w-toggle]")?.addEventListener("click", () => {
-      expanded = !expanded;
-      try {
-        localStorage.setItem(COLLAPSED_KEY, expanded ? "1" : "0");
-      } catch {
-        // Ignore storage errors in restricted contexts.
-      }
-      render();
-      if (expanded) void syncState();
-    });
+    root.querySelector("[data-w-open]")?.addEventListener("click", handlePillClick);
+  }
 
-    root.querySelector("[data-w-enabled]")?.addEventListener("click", () => {
-      void toggleEnabled();
-    });
-
-    root.querySelector("[data-w-sweep]")?.addEventListener("click", () => {
-      void quickSweep();
-    });
-
-    root.querySelectorAll("[data-w-protect]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const id = btn.getAttribute("data-w-protect");
-        const title = btn.getAttribute("data-w-title") || "";
-        if (id) void protectThread(id, title);
-      });
-    });
+  function applySettings(nextSettings) {
+    const prevShow = settings.showWidget;
+    settings = normalizeSettings(nextSettings);
+    render();
+    if (settings.showWidget && (!prevShow || stats.totalActive === 0)) {
+      void syncState();
+    }
   }
 
   const stopLocale = api.onLocaleChange((nextLocale) => {
@@ -228,28 +221,41 @@ export async function mount(root, api) {
   });
 
   const stopStorage = api.storage.onChange((nextSettings) => {
-    settings = normalizeSettings(nextSettings);
-    render();
-    void syncState();
+    applySettings(nextSettings);
   });
 
-  const stopBroadcast = subscribeProtectedChange((ids) => {
-    protectedThreadIds = ids;
-    render();
-    void syncState();
+  const stopSettingsBroadcast = subscribeSettingsChange((nextSettings) => {
+    applySettings(nextSettings);
   }, api.signal);
 
+  const stopBroadcast = subscribeProtectedChange(() => {
+    if (settings.showWidget) void syncState();
+  }, api.signal);
+
+  const onFocus = () => {
+    if (settings.showWidget) void syncState();
+  };
+  if (typeof window !== "undefined") {
+    window.addEventListener("focus", onFocus, { signal: api.signal });
+  }
+
   render();
-  void syncState();
+  if (settings.showWidget) {
+    void syncState();
+  }
   pollTimer = setInterval(() => {
-    if (!document.hidden) void syncState();
+    if (settings.showWidget && typeof document !== "undefined" && !document.hidden) {
+      void syncState();
+    }
   }, 120_000);
 
   return () => {
     stopLocale();
     stopStorage();
+    stopSettingsBroadcast();
     stopBroadcast();
-    if (noticeTimer !== null) clearTimeout(noticeTimer);
+    cancelNav?.();
+    cancelNav = null;
     if (pollTimer !== null) clearInterval(pollTimer);
     root.replaceChildren();
   };
